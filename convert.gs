@@ -1,5 +1,6 @@
 /*
-Process CSV translation files in SOURCE_FOLDER_ID.
+Process CSV translation files in SOURCE_FOLDER_ID and convert them into
+formatted Google Sheets.
 
 For each .csv in the folder:
 1. Ensure a Google Sheet of the same base name exists in the same folder.
@@ -25,7 +26,15 @@ For each .csv in the folder:
 
 Errors processing individual CSVs are logged and don't stop the run.
 
-Required configuration (defined elsewhere):
+Reporting:
+- If SLACK_WEBHOOK_URL is set in config.gs, a summary of Sheet creations,
+  regenerations, and errors is posted to that Slack webhook at the end of each
+  run. If empty, posting is skipped.
+
+Shared helpers (locking, reporting, batch iteration, locale parsing) live in
+utils.gs.
+
+Required configuration (defined in config.gs):
   SOURCE_FOLDER_ID - Drive folder containing the CSVs.
 
 Required services:
@@ -45,43 +54,25 @@ const MOZILLA_AUDIENCE_FIELD_ID = 'REDACTED';
 const MOZILLA_AUDIENCE_SPECIFIC_WORKGROUPS_CHOICE_ID = 'REDACTED';
 
 function processCsvFiles() {
-  const lock = LockService.getScriptLock();
-
-  if (!lock.tryLock(30 * 1000)) {
-    Logger.log('Another run is in progress. Exiting.');
-    return;
-  }
-
-  try {
+  runWithReport('processCsvFiles', report => {
     const folder = DriveApp.getFolderById(SOURCE_FOLDER_ID);
 
-    const csvFiles = [];
-    const csvIter = folder.getFilesByType(MimeType.CSV);
-    while (csvIter.hasNext()) {
-      csvFiles.push(csvIter.next());
-    }
-
-    for (const csvFile of csvFiles) {
-      try {
-        processSingleCsvFile(folder, csvFile);
-      } catch (error) {
-        console.error(`Failed processing ${csvFile.getName()}: ${error}`);
-      }
-    }
-  } finally {
-    lock.releaseLock();
-  }
+    processBatch(folder, MimeType.CSV, report, (csvFile, r) =>
+      processSingleCsvFile(folder, csvFile, r)
+    );
+  });
 }
 
-function processSingleCsvFile(folder, csvFile) {
+function processSingleCsvFile(folder, csvFile, report) {
   Logger.log(`Processing CSV: ${csvFile.getName()}`);
 
   applyMozillaAudienceIndicator(csvFile.getId());
 
   const csvName = csvFile.getName().replace(/\.csv$/i, '');
-  const locale = extractLocaleFromCsvName(csvFile.getName());
+  const { locale } = splitLocaleFromName(csvFile.getName());
 
   let spreadsheet = findSpreadsheetByName(folder, csvName);
+  const created = !spreadsheet;
 
   if (!spreadsheet) {
     Logger.log(`No matching Sheet found. Creating: ${csvName}`);
@@ -133,14 +124,14 @@ function processSingleCsvFile(folder, csvFile) {
 
   applyMozillaAudienceIndicator(spreadsheet.getId());
 
+  recordEvent(
+    report,
+    created ? 'Sheet created' : 'Sheet regenerated',
+    csvName,
+    spreadsheet.getUrl()
+  );
+
   Logger.log(`Finished processing ${csvFile.getName()}`);
-}
-
-function extractLocaleFromCsvName(fileName) {
-  const baseName = fileName.replace(/\.csv$/i, '');
-  const match = baseName.match(/_([^_]+)$/);
-
-  return match ? match[1].trim() : '';
 }
 
 function cleanTargetColumns(values, locale) {

@@ -1,89 +1,90 @@
 /*
-1. Check for .csv files in the Translation folder.
-2. For each CSV, determine BASE_FILENAME by removing the locale suffix and .csv extension.
-   Example:
-   CC58000_win10_spotlight_security_may2026_v2_foo.csv
-   becomes:
-   CC58000_win10_spotlight_security_may2026_v2
-3. Look up BASE_FILENAME via a Drive query for Google Sheets matching the name,
-   then filter to those whose parent folder is named "Source" and lives under
-   DEST_FOLDER_ID. Results are memoized in-memory for the current run so
-   multiple locales of the same base name don't re-query.
-4. Once the matching source Google Sheet is found, move one level up from Source,
-   find the Delivery folder, and create Original and Delivery to Customer folders if missing.
-5. Move the generated Google Sheet to Delivery to Customer. If a file with the
-   same name already exists in that folder, trash it first and log a warning.
-6. Move the CSV to Original. If a file with the same name already exists in
-   that folder, trash it first and log a warning.
+Organize delivered translations from the Translation folder into per-project
+Delivery folders under DEST_FOLDER_ID.
 
-The script logs an error and skips the file if:
-* The source Google Sheet is not found.
-* The source file is not in a Source folder under DEST_FOLDER_ID.
-* There is no Delivery folder at the same level as Source.
-* The generated Google Sheet matching BASE_FILENAME + locale is not found in the Translation folder.
+Entry points:
+  moveAllDelivered    - process both CSV/Sheet pairs and Docs in one run.
+  moveDeliveredFiles  - process only CSV/Sheet pairs.
+  moveDeliveredDocs   - process only Docs.
 
-If SLACK_WEBHOOK_URL is defined (alongside SOURCE_FOLDER_ID / DEST_FOLDER_ID),
-a summary of file moves and errors is posted to that Slack webhook at the end
-of each run. If the constant is missing or empty, posting is skipped silently.
+CSV/Sheet flow (per CSV in SOURCE_FOLDER_ID):
+1. Determine BASE_FILENAME by stripping the locale suffix and .csv extension.
+   Example: CC58000_..._v2_foo.csv  ->  CC58000_..._v2
+2. Look up BASE_FILENAME via a Drive query, filtered to Google Sheets whose
+   parent folder is named "Source" and lives somewhere under DEST_FOLDER_ID.
+   Results are memoized in-memory per run so multiple locales of the same base
+   name don't re-query.
+3. Walk one level up from Source to the project folder; find Delivery, and
+   create Original / Delivery to Customer subfolders if missing.
+4. Move the generated Google Sheet (same name as the CSV minus extension) into
+   Delivery to Customer.
+5. Move the CSV into Original.
 
-Make sure to structure the request correctly and keep the same file name between Drive Connector
-and Source folder. Rename the original if needed.
+Doc flow (per Google Doc in SOURCE_FOLDER_ID):
+1. Determine BASE_FILENAME by stripping the locale suffix.
+2. Look up BASE_FILENAME via the same Source-folder Drive query (for Docs).
+3. Find Delivery at the same level as Source.
+4. Move the Doc directly into Delivery (no Original / Delivery to Customer
+   subfolders are involved).
+
+Common to both flows:
+- If a file with the same name already exists in the destination, it is
+  trashed first and a warning is logged.
+- A file is skipped (with an error recorded) when the source match cannot be
+  found, the Source folder has no sibling Delivery, or the generated Sheet
+  cannot be located in the Translation folder.
+
+Reporting:
+- If SLACK_WEBHOOK_URL is set in config.gs, a per-run summary of events and
+  errors is posted to that Slack webhook. If empty, posting is skipped.
+
+Shared helpers (locking, reporting, batch iteration, locale parsing) live in
+utils.gs.
+
+Make sure to structure the request correctly and keep the same file name
+between Drive Connector and Source folder. Rename the original if needed.
 */
 
 // Process both CSVs and Google Docs in one run.
 function moveAllDelivered() {
-  const report = createRunReport();
+  runWithReport('moveAllDelivered', report => {
+    const sourceFolder = DriveApp.getFolderById(SOURCE_FOLDER_ID);
+    const destRootFolder = DriveApp.getFolderById(DEST_FOLDER_ID);
 
-  try {
-    withScriptLock(() => {
-      const sourceFolder = DriveApp.getFolderById(SOURCE_FOLDER_ID);
-      const destRootFolder = DriveApp.getFolderById(DEST_FOLDER_ID);
+    const csvCache = new Map();
+    processBatch(sourceFolder, MimeType.CSV, report, (csvFile, r) =>
+      moveSingleDeliveredFile(csvFile, sourceFolder, destRootFolder, csvCache, r)
+    );
 
-      processCsvBatch(sourceFolder, destRootFolder, report);
-      processDocBatch(sourceFolder, destRootFolder, report);
-    });
-  } finally {
-    sendSlackReport(report, 'moveAllDelivered');
-  }
+    const docCache = new Map();
+    processBatch(sourceFolder, MimeType.GOOGLE_DOCS, report, (doc, r) =>
+      moveSingleDeliveredDoc(doc, destRootFolder, docCache, r)
+    );
+  });
 }
 
 function moveDeliveredFiles() {
-  const report = createRunReport();
+  runWithReport('moveDeliveredFiles', report => {
+    const sourceFolder = DriveApp.getFolderById(SOURCE_FOLDER_ID);
+    const destRootFolder = DriveApp.getFolderById(DEST_FOLDER_ID);
+    const cache = new Map();
 
-  try {
-    withScriptLock(() => {
-      const sourceFolder = DriveApp.getFolderById(SOURCE_FOLDER_ID);
-      const destRootFolder = DriveApp.getFolderById(DEST_FOLDER_ID);
-
-      processCsvBatch(sourceFolder, destRootFolder, report);
-    });
-  } finally {
-    sendSlackReport(report, 'moveDeliveredFiles');
-  }
+    processBatch(sourceFolder, MimeType.CSV, report, (csvFile, r) =>
+      moveSingleDeliveredFile(csvFile, sourceFolder, destRootFolder, cache, r)
+    );
+  });
 }
 
-function processCsvBatch(sourceFolder, destRootFolder, report) {
-  const csvFiles = [];
-  const csvIter = sourceFolder.getFilesByType(MimeType.CSV);
-  while (csvIter.hasNext()) {
-    csvFiles.push(csvIter.next());
-  }
+function moveDeliveredDocs() {
+  runWithReport('moveDeliveredDocs', report => {
+    const sourceFolder = DriveApp.getFolderById(SOURCE_FOLDER_ID);
+    const destRootFolder = DriveApp.getFolderById(DEST_FOLDER_ID);
+    const cache = new Map();
 
-  const sourceMatchCache = new Map();
-
-  for (const csvFile of csvFiles) {
-    try {
-      moveSingleDeliveredFile(
-        csvFile,
-        sourceFolder,
-        destRootFolder,
-        sourceMatchCache,
-        report
-      );
-    } catch (error) {
-      recordError(report, `ERROR processing ${csvFile.getName()}: ${error}`);
-    }
-  }
+    processBatch(sourceFolder, MimeType.GOOGLE_DOCS, report, (doc, r) =>
+      moveSingleDeliveredDoc(doc, destRootFolder, cache, r)
+    );
+  });
 }
 
 function moveSingleDeliveredFile(
@@ -95,7 +96,7 @@ function moveSingleDeliveredFile(
 ) {
   const csvFileName = csvFile.getName();
   const sheetFileName = csvFileName.replace(/\.csv$/i, '');
-  const baseFileName = removeLocaleFromFileName(csvFileName);
+  const { base: baseFileName } = splitLocaleFromName(csvFileName);
 
   Logger.log(`Processing CSV: ${csvFileName}`);
   Logger.log(`Base filename: ${baseFileName}`);
@@ -178,9 +179,9 @@ function moveSingleDeliveredFile(
     generatedSheet.getName()
   );
   generatedSheet.moveTo(deliveryToCustomerFolder);
-  recordMove(
+  recordEvent(
     report,
-    'Sheet',
+    'Sheet moved',
     generatedSheet.getName(),
     deliveryToCustomerFolder.getUrl()
   );
@@ -191,74 +192,14 @@ function moveSingleDeliveredFile(
 
   removeExistingFilesWithName(originalFolder, csvFile.getName());
   csvFile.moveTo(originalFolder);
-  recordMove(report, 'CSV', csvFile.getName(), originalFolder.getUrl());
+  recordEvent(report, 'CSV moved', csvFile.getName(), originalFolder.getUrl());
 
   Logger.log(`Moved CSV "${csvFile.getName()}" to: ${originalFolder.getUrl()}`);
 }
 
-function removeExistingFilesWithName(folder, name) {
-  const files = folder.getFilesByName(name);
-
-  while (files.hasNext()) {
-    const file = files.next();
-
-    console.warn(
-      `Removing existing file "${file.getName()}" in ${folder.getUrl()}: ${file.getUrl()}`
-    );
-
-    file.setTrashed(true);
-  }
-}
-
-/*
-Move Google Docs from the Translation folder to their matching Delivery folder.
-
-For each Doc in SOURCE_FOLDER_ID:
-1. Determine BASE_FILENAME by stripping the locale suffix from the Doc name.
-2. Look up a Doc matching BASE_FILENAME in a Source folder under DEST_FOLDER_ID.
-3. If found, locate the Delivery folder at the same level as Source.
-4. Move the Doc directly into Delivery. If a file with the same name already
-   exists there, trash it first and log a warning.
-
-Unlike moveDeliveredFiles, this does not create or use Original / Delivery to
-Customer subfolders; the Doc is placed directly in Delivery.
-*/
-function moveDeliveredDocs() {
-  const report = createRunReport();
-
-  try {
-    withScriptLock(() => {
-      const sourceFolder = DriveApp.getFolderById(SOURCE_FOLDER_ID);
-      const destRootFolder = DriveApp.getFolderById(DEST_FOLDER_ID);
-
-      processDocBatch(sourceFolder, destRootFolder, report);
-    });
-  } finally {
-    sendSlackReport(report, 'moveDeliveredDocs');
-  }
-}
-
-function processDocBatch(sourceFolder, destRootFolder, report) {
-  const docs = [];
-  const docIter = sourceFolder.getFilesByType(MimeType.GOOGLE_DOCS);
-  while (docIter.hasNext()) {
-    docs.push(docIter.next());
-  }
-
-  const sourceMatchCache = new Map();
-
-  for (const doc of docs) {
-    try {
-      moveSingleDeliveredDoc(doc, destRootFolder, sourceMatchCache, report);
-    } catch (error) {
-      recordError(report, `ERROR processing ${doc.getName()}: ${error}`);
-    }
-  }
-}
-
 function moveSingleDeliveredDoc(doc, destRootFolder, sourceMatchCache, report) {
   const docName = doc.getName();
-  const baseFileName = removeLocaleFromFileName(docName);
+  const { base: baseFileName } = splitLocaleFromName(docName);
 
   Logger.log(`Processing Doc: ${docName}`);
   Logger.log(`Base filename: ${baseFileName}`);
@@ -299,9 +240,23 @@ function moveSingleDeliveredDoc(doc, destRootFolder, sourceMatchCache, report) {
 
   removeExistingFilesWithName(deliveryFolder, docName);
   doc.moveTo(deliveryFolder);
-  recordMove(report, 'Doc', docName, deliveryFolder.getUrl());
+  recordEvent(report, 'Doc moved', docName, deliveryFolder.getUrl());
 
   Logger.log(`Moved Doc "${docName}" to: ${deliveryFolder.getUrl()}`);
+}
+
+function removeExistingFilesWithName(folder, name) {
+  const files = folder.getFilesByName(name);
+
+  while (files.hasNext()) {
+    const file = files.next();
+
+    console.warn(
+      `Removing existing file "${file.getName()}" in ${folder.getUrl()}: ${file.getUrl()}`
+    );
+
+    file.setTrashed(true);
+  }
 }
 
 function getSourceMatch(
@@ -311,15 +266,7 @@ function getSourceMatch(
   mimeType
 ) {
   if (sourceMatchCache.has(baseFileName)) {
-    const cached = sourceMatchCache.get(baseFileName);
-
-    if (cached) {
-      Logger.log(`Using memoized Source match for "${baseFileName}".`);
-    } else {
-      Logger.log(`Memoized miss for "${baseFileName}". Skipping search.`);
-    }
-
-    return cached;
+    return sourceMatchCache.get(baseFileName);
   }
 
   const match = searchSourceMatch(baseFileName, destRootFolder, mimeType);
@@ -343,6 +290,7 @@ function searchSourceMatch(baseFileName, destRootFolder, mimeType) {
 
   const files = DriveApp.searchFiles(query);
   const matches = [];
+  const descendantCache = new Map();
 
   while (files.hasNext()) {
     const file = files.next();
@@ -361,7 +309,7 @@ function searchSourceMatch(baseFileName, destRootFolder, mimeType) {
       continue;
     }
 
-    if (!isDescendantOf(parent, destRootFolder)) {
+    if (!isDescendantOf(parent, destRootFolder, descendantCache)) {
       continue;
     }
 
@@ -377,7 +325,7 @@ function searchSourceMatch(baseFileName, destRootFolder, mimeType) {
 
   if (matches.length > 1) {
     console.warn(
-      `Found multiple Google Sheets named "${baseFileName}". Using the first one.`
+      `Found multiple files named "${baseFileName}". Using the first one.`
     );
 
     matches.forEach(m => {
@@ -385,7 +333,7 @@ function searchSourceMatch(baseFileName, destRootFolder, mimeType) {
     });
   }
 
-  const referenceSheet = matches[0].file;
+  const referenceFile = matches[0].file;
   const sourceFolder = matches[0].sourceFolder;
   const projectFolder = getFirstParent(sourceFolder);
 
@@ -397,32 +345,32 @@ function searchSourceMatch(baseFileName, destRootFolder, mimeType) {
   }
 
   return {
-    referenceSheet,
+    referenceFile,
     sourceFolder,
     projectFolder
   };
 }
 
-function isDescendantOf(folder, ancestor) {
+function isDescendantOf(folder, ancestor, cache) {
   const ancestorId = ancestor.getId();
-  let current = folder;
+  const startId = folder.getId();
 
+  if (cache && cache.has(startId)) {
+    return cache.get(startId);
+  }
+
+  let current = folder;
   while (current) {
     if (current.getId() === ancestorId) {
+      if (cache) cache.set(startId, true);
       return true;
     }
-
     const parents = current.getParents();
     current = parents.hasNext() ? parents.next() : null;
   }
 
+  if (cache) cache.set(startId, false);
   return false;
-}
-
-function removeLocaleFromFileName(fileName) {
-  const nameWithoutExtension = fileName.replace(/\.csv$/i, '');
-
-  return nameWithoutExtension.replace(/_[^_]+$/, '');
 }
 
 function findGoogleSheetByNameInFolder(folder, name) {
@@ -458,74 +406,4 @@ function getFirstParent(fileOrFolder) {
   const parents = fileOrFolder.getParents();
 
   return parents.hasNext() ? parents.next() : null;
-}
-
-function withScriptLock(fn) {
-  const lock = LockService.getScriptLock();
-
-  if (!lock.tryLock(30 * 1000)) {
-    Logger.log('Another run is in progress. Exiting.');
-    return;
-  }
-
-  try {
-    fn();
-  } finally {
-    lock.releaseLock();
-  }
-}
-
-function createRunReport() {
-  return { moves: [], errors: [] };
-}
-
-function recordMove(report, kind, name, destinationUrl) {
-  report.moves.push({ kind, name, destinationUrl });
-}
-
-function recordError(report, message) {
-  report.errors.push(message);
-  console.error(message);
-}
-
-function sendSlackReport(report, runLabel) {
-  if (typeof SLACK_WEBHOOK_URL === 'undefined' || !SLACK_WEBHOOK_URL) {
-    Logger.log('SLACK_WEBHOOK_URL is not configured. Skipping Slack notification.');
-    return;
-  }
-
-  if (report.moves.length === 0 && report.errors.length === 0) {
-    return;
-  }
-
-  const lines = [];
-
-  lines.push(
-    `*${runLabel}*: ${report.moves.length} move(s), ${report.errors.length} error(s)`
-  );
-
-  if (report.moves.length > 0) {
-    lines.push('', '*Moves:*');
-    report.moves.forEach(m => {
-      lines.push(`• [${m.kind}] ${m.name} → ${m.destinationUrl}`);
-    });
-  }
-
-  if (report.errors.length > 0) {
-    lines.push('', '*Errors:*');
-    report.errors.forEach(e => {
-      lines.push(`• ${e}`);
-    });
-  }
-
-  try {
-    UrlFetchApp.fetch(SLACK_WEBHOOK_URL, {
-      method: 'post',
-      contentType: 'application/json',
-      payload: JSON.stringify({ text: lines.join('\n') }),
-      muteHttpExceptions: true
-    });
-  } catch (error) {
-    console.error(`Failed to send Slack notification: ${error}`);
-  }
 }
