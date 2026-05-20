@@ -9,8 +9,11 @@ For each .csv in the folder:
    (but still ensure the Mozilla Audience Drive label is applied).
 3. Otherwise, regenerate the Sheet from the CSV:
    - Parse the CSV.
-   - Drop the "Target Language" column, but make sure that each cell is equal
-     to the cell in column "EN Copy".
+   - Detect the template by the first column header and drop the target
+     column:
+     * Survey template (first column "Key"): always drop "Translation".
+     * Standard template (otherwise): drop "Target Language" only when every
+       cell equals "EN Copy".
    - Rename the last column header to the locale extracted from the CSV name
      (e.g. "..._fr.csv" -> "fr"). Smartling always places the target
      column last.
@@ -40,11 +43,22 @@ Required services:
 */
 
 const COLUMN_WIDTH = 220;
+const SURVEY_COLUMN_WIDTH = 400;
 const HEADER_COLOR = '#f9cb9c';
 
 const EN_COPY_HEADER = 'EN Copy';
 const TARGET_LANGUAGE_HEADER = 'Target Language';
 const TARGET_CHARACTER_LIMIT_HEADER = 'Target Character Limit';
+
+// Survey template (first column "Key"): the "Translation" column is always
+// dropped, and columns are rendered wider (SURVEY_COLUMN_WIDTH).
+const KEY_HEADER = 'Key';
+const DEFAULT_TEXT_HEADER = 'Default Text';
+const TRANSLATION_HEADER = 'Translation';
+
+function isSurveyTemplate(values) {
+  return values.length > 0 && values[0][0] === KEY_HEADER;
+}
 
 // This is the "Specific Workgroups and Individuals" label for Mozilla Audience
 const MOZILLA_AUDIENCE_LABEL_ID = 'REDACTED';
@@ -108,6 +122,7 @@ function processSingleCsvFile(folder, csvFile, report) {
     return;
   }
 
+  const survey = isSurveyTemplate(values);
   values = cleanTargetColumns(values, locale);
 
   const sheet = spreadsheet.getSheets()[0];
@@ -119,7 +134,12 @@ function processSingleCsvFile(folder, csvFile, report) {
     .getRange(1, 1, values.length, values[0].length)
     .setValues(values);
 
-  formatSheet(sheet, values.length, values[0].length);
+  formatSheet(
+    sheet,
+    values.length,
+    values[0].length,
+    survey ? SURVEY_COLUMN_WIDTH : COLUMN_WIDTH
+  );
 
   applyMozillaAudienceIndicator(spreadsheet.getId());
 
@@ -134,25 +154,21 @@ function processSingleCsvFile(folder, csvFile, report) {
 }
 
 function cleanTargetColumns(values, locale) {
-  const headers = values[0];
+  const survey = isSurveyTemplate(values);
 
-  const enCopyIndex = headers.indexOf(EN_COPY_HEADER);
-  const targetLanguageIndex = headers.indexOf(TARGET_LANGUAGE_HEADER);
+  Logger.log(
+    `Template detected: ${survey ? 'survey' : 'standard'} ` +
+      `(first column header: ${JSON.stringify(values[0][0])})`
+  );
 
-  if (enCopyIndex !== -1 && targetLanguageIndex !== -1) {
-    const targetMatchesEnCopy = values
-      .slice(1)
-      .every(
-        row =>
-          normalizeCell(row[targetLanguageIndex]) ===
-          normalizeCell(row[enCopyIndex])
-      );
-
-    if (targetMatchesEnCopy) {
-      values = values.map(row =>
-        row.filter((_, index) => index !== targetLanguageIndex)
-      );
-    }
+  if (survey) {
+    values = dropColumnByHeader(values, TRANSLATION_HEADER);
+  } else {
+    values = dropRedundantTargetColumn(
+      values,
+      EN_COPY_HEADER,
+      TARGET_LANGUAGE_HEADER
+    );
   }
 
   if (locale && values[0].length > 0) {
@@ -160,6 +176,40 @@ function cleanTargetColumns(values, locale) {
   }
 
   return values;
+}
+
+// If every row's targetHeader cell equals the corresponding sourceHeader cell,
+// drop the targetHeader column. Returns the original values otherwise.
+function dropRedundantTargetColumn(values, sourceHeader, targetHeader) {
+  const headers = values[0];
+  const sourceIdx = headers.indexOf(sourceHeader);
+  const targetIdx = headers.indexOf(targetHeader);
+
+  if (sourceIdx === -1 || targetIdx === -1) {
+    return values;
+  }
+
+  const targetMatchesSource = values.slice(1).every(
+    row => normalizeCell(row[targetIdx]) === normalizeCell(row[sourceIdx])
+  );
+
+  if (!targetMatchesSource) {
+    return values;
+  }
+
+  return dropColumnByHeader(values, targetHeader);
+}
+
+// Drops the column whose header equals `header`. Returns values unchanged if
+// no such column exists.
+function dropColumnByHeader(values, header) {
+  const idx = values[0].indexOf(header);
+
+  if (idx === -1) {
+    return values;
+  }
+
+  return values.map(row => row.filter((_, i) => i !== idx));
 }
 
 function normalizeCell(value) {
@@ -180,7 +230,7 @@ function findSpreadsheetByName(folder, name) {
   return null;
 }
 
-function formatSheet(sheet, numRows, numCols) {
+function formatSheet(sheet, numRows, numCols, columnWidth) {
   sheet.getRange(1, 1, numRows, numCols)
     .setVerticalAlignment('top')
     .setWrap(true);
@@ -189,7 +239,7 @@ function formatSheet(sheet, numRows, numCols) {
     .setBackground(HEADER_COLOR)
     .setFontWeight('bold');
 
-  sheet.setColumnWidths(1, numCols, COLUMN_WIDTH);
+  sheet.setColumnWidths(1, numCols, columnWidth);
   sheet.setFrozenRows(1);
 
   addCharacterLimitConditionalFormatting(sheet, numRows, numCols);
