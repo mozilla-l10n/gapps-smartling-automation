@@ -95,8 +95,8 @@ function moveSingleDeliveredFile(
   report
 ) {
   const csvFileName = csvFile.getName();
-  const sheetFileName = csvFileName.replace(/\.csv$/i, '');
-  const { base: baseFileName } = splitLocaleFromName(csvFileName);
+  const { nameWithoutExtension: sheetFileName, base: baseFileName } =
+    splitLocaleFromName(csvFileName);
 
   Logger.log(`Processing CSV: ${csvFileName}`);
   Logger.log(`Base filename: ${baseFileName}`);

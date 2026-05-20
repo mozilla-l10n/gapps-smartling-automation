@@ -4,7 +4,8 @@ Shared helpers used by organize.gs and convert.gs:
 - withScriptLock: prevents concurrent runs of an entry point.
 - processBatch: iterates files of a given mimeType in a folder, calling a
   per-file function and recording any thrown error as a run report entry.
-- splitLocaleFromName: splits a CSV/Doc name into its base and locale suffix.
+- splitLocaleFromName: parses a CSV/Doc name into its no-extension form, its
+  base (no locale suffix), and its locale.
 - createRunReport / recordEvent / recordError / sendSlackReport: per-run
   collection and Slack posting.
 
@@ -55,19 +56,25 @@ function processBatch(folder, mimeType, report, perFileFn) {
   }
 }
 
-// Splits names like "foo_bar_v2_fr.csv" into { base: "foo_bar_v2", locale: "fr" }.
-// Strips a trailing .csv extension before splitting; falls back to the whole
-// name with an empty locale if there is no "_xxx" suffix.
+// Parses names like "foo_bar_v2_fr.csv" into:
+//   { nameWithoutExtension: "foo_bar_v2_fr", base: "foo_bar_v2", locale: "fr" }
+// Strips a trailing .csv extension if present; falls back to base = name and
+// locale = "" if there is no "_xxx" suffix.
 function splitLocaleFromName(fileName) {
-  const baseName = fileName.replace(/\.csv$/i, '');
-  const match = baseName.match(/_([^_]+)$/);
+  const nameWithoutExtension = fileName.replace(/\.csv$/i, '');
+  const match = nameWithoutExtension.match(/_([^_]+)$/);
 
   if (!match) {
-    return { base: baseName, locale: '' };
+    return {
+      nameWithoutExtension,
+      base: nameWithoutExtension,
+      locale: ''
+    };
   }
 
   return {
-    base: baseName.slice(0, match.index),
+    nameWithoutExtension,
+    base: nameWithoutExtension.slice(0, match.index),
     locale: match[1].trim()
   };
 }

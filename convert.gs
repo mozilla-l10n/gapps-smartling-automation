@@ -4,18 +4,16 @@ formatted Google Sheets.
 
 For each .csv in the folder:
 1. Ensure a Google Sheet of the same base name exists in the same folder.
-   Create it (in the folder, not in My Drive) if missing.
+   Create it (in the same folder) if missing.
 2. If the Sheet already has content and was updated after the CSV, skip it
    (but still ensure the Mozilla Audience Drive label is applied).
 3. Otherwise, regenerate the Sheet from the CSV:
    - Parse the CSV.
-   - If every "Target Language" cell equals the matching "EN Copy" cell
-     (translator returned the source unchanged), drop the "Target Language"
-     column.
+   - Drop the "Target Language" column, but make sure that each cell is equal
+     to the cell in column "EN Copy".
    - Rename the last column header to the locale extracted from the CSV name
-     (e.g. "..._fr.csv" -> "fr"). The producer always places the target
-     column last, so this renames either Target Language, or EN Copy when it
-     was kept because the target duplicated the source.
+     (e.g. "..._fr.csv" -> "fr"). Smartling always places the target
+     column last.
    - Write the values into the first sheet, replacing prior content.
    - Apply header styling, column widths, frozen header row, wrap/top-align,
      and conditional formatting that highlights target cells exceeding the
@@ -48,7 +46,7 @@ const EN_COPY_HEADER = 'EN Copy';
 const TARGET_LANGUAGE_HEADER = 'Target Language';
 const TARGET_CHARACTER_LIMIT_HEADER = 'Target Character Limit';
 
-// This is the Specific Workgroups and Individuals label for Mozilla Audience
+// This is the "Specific Workgroups and Individuals" label for Mozilla Audience
 const MOZILLA_AUDIENCE_LABEL_ID = 'REDACTED';
 const MOZILLA_AUDIENCE_FIELD_ID = 'REDACTED';
 const MOZILLA_AUDIENCE_SPECIFIC_WORKGROUPS_CHOICE_ID = 'REDACTED';
@@ -68,8 +66,9 @@ function processSingleCsvFile(folder, csvFile, report) {
 
   applyMozillaAudienceIndicator(csvFile.getId());
 
-  const csvName = csvFile.getName().replace(/\.csv$/i, '');
-  const { locale } = splitLocaleFromName(csvFile.getName());
+  const { nameWithoutExtension: csvName, locale } = splitLocaleFromName(
+    csvFile.getName()
+  );
 
   let spreadsheet = findSpreadsheetByName(folder, csvName);
   const created = !spreadsheet;
