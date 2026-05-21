@@ -161,9 +161,10 @@ function moveSingleDeliveredFile(
     Logger.log(`Created folder "Original": ${originalFolder.getUrl()}`);
   }
 
-  const generatedSheet = findGoogleSheetByNameInFolder(
+  const generatedSheet = findFileInFolderByName(
     sourceFolder,
-    sheetFileName
+    sheetFileName,
+    MimeType.GOOGLE_SHEETS
   );
 
   if (!generatedSheet) {
@@ -243,20 +244,6 @@ function moveSingleDeliveredDoc(doc, destRootFolder, sourceMatchCache, report) {
   recordEvent(report, 'Doc moved', docName, deliveryFolder.getUrl());
 
   Logger.log(`Moved Doc "${docName}" to: ${deliveryFolder.getUrl()}`);
-}
-
-function removeExistingFilesWithName(folder, name) {
-  const files = folder.getFilesByName(name);
-
-  while (files.hasNext()) {
-    const file = files.next();
-
-    console.warn(
-      `Removing existing file "${file.getName()}" in ${folder.getUrl()}: ${file.getUrl()}`
-    );
-
-    file.setTrashed(true);
-  }
 }
 
 function getSourceMatch(
@@ -373,37 +360,3 @@ function isDescendantOf(folder, ancestor, cache) {
   return false;
 }
 
-function findGoogleSheetByNameInFolder(folder, name) {
-  const files = folder.getFilesByName(name);
-
-  while (files.hasNext()) {
-    const file = files.next();
-
-    if (file.getMimeType() === MimeType.GOOGLE_SHEETS) {
-      return file;
-    }
-  }
-
-  return null;
-}
-
-function findChildFolderByNameCaseInsensitive(parentFolder, targetName) {
-  const folders = parentFolder.getFolders();
-  const normalizedTargetName = targetName.toLowerCase();
-
-  while (folders.hasNext()) {
-    const folder = folders.next();
-
-    if (folder.getName().toLowerCase() === normalizedTargetName) {
-      return folder;
-    }
-  }
-
-  return null;
-}
-
-function getFirstParent(fileOrFolder) {
-  const parents = fileOrFolder.getParents();
-
-  return parents.hasNext() ? parents.next() : null;
-}

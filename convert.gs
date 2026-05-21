@@ -46,24 +46,13 @@ const COLUMN_WIDTH = 220;
 const SURVEY_COLUMN_WIDTH = 400;
 const HEADER_COLOR = '#f9cb9c';
 
-const EN_COPY_HEADER = 'EN Copy';
-const TARGET_LANGUAGE_HEADER = 'Target Language';
-const TARGET_CHARACTER_LIMIT_HEADER = 'Target Character Limit';
-
 // Survey template (first column "Key"): the "Translation" column is always
-// dropped, and columns are rendered wider (SURVEY_COLUMN_WIDTH).
-const KEY_HEADER = 'Key';
-const DEFAULT_TEXT_HEADER = 'Default Text';
-const TRANSLATION_HEADER = 'Translation';
-
+// dropped, and columns are rendered wider (SURVEY_COLUMN_WIDTH). Loose check
+// kept here on purpose — Smartling-produced CSVs may include extra columns
+// that the strict utils.gs detectTemplate would not classify as survey.
 function isSurveyTemplate(values) {
   return values.length > 0 && values[0][0] === KEY_HEADER;
 }
-
-// This is the "Specific Workgroups and Individuals" label for Mozilla Audience
-const MOZILLA_AUDIENCE_LABEL_ID = 'REDACTED';
-const MOZILLA_AUDIENCE_FIELD_ID = 'REDACTED';
-const MOZILLA_AUDIENCE_SPECIFIC_WORKGROUPS_CHOICE_ID = 'REDACTED';
 
 function processCsvFiles() {
   runWithReport('processCsvFiles', report => {
@@ -84,7 +73,14 @@ function processSingleCsvFile(folder, csvFile, report) {
     csvFile.getName()
   );
 
-  let spreadsheet = findSpreadsheetByName(folder, csvName);
+  const existingFile = findFileInFolderByName(
+    folder,
+    csvName,
+    MimeType.GOOGLE_SHEETS
+  );
+  let spreadsheet = existingFile
+    ? SpreadsheetApp.openById(existingFile.getId())
+    : null;
   const created = !spreadsheet;
 
   if (!spreadsheet) {
@@ -216,20 +212,6 @@ function normalizeCell(value) {
   return String(value || '').trim();
 }
 
-function findSpreadsheetByName(folder, name) {
-  const files = folder.getFilesByName(name);
-
-  while (files.hasNext()) {
-    const file = files.next();
-
-    if (file.getMimeType() === MimeType.GOOGLE_SHEETS) {
-      return SpreadsheetApp.openById(file.getId());
-    }
-  }
-
-  return null;
-}
-
 function formatSheet(sheet, numRows, numCols, columnWidth) {
   sheet.getRange(1, 1, numRows, numCols)
     .setVerticalAlignment('top')
@@ -246,39 +228,6 @@ function formatSheet(sheet, numRows, numCols, columnWidth) {
 }
 
 // Add target label to files (Mozilla audience) if not set yet
-function applyMozillaAudienceIndicator(fileId) {
-  const labelsResponse = Drive.Files.listLabels(fileId, {
-    fields: 'labels(id,fields)'
-  });
-
-  const existingLabel = labelsResponse.labels?.find(
-    label => label.id === MOZILLA_AUDIENCE_LABEL_ID
-  );
-
-  const existingFieldValue =
-    existingLabel?.fields?.[MOZILLA_AUDIENCE_FIELD_ID]?.selection;
-
-  if (existingFieldValue && existingFieldValue.length > 0) {
-    return;
-  }
-
-  Drive.Files.modifyLabels({
-    labelModifications: [
-      {
-        labelId: MOZILLA_AUDIENCE_LABEL_ID,
-        fieldModifications: [
-          {
-            fieldId: MOZILLA_AUDIENCE_FIELD_ID,
-            setSelectionValues: [
-              MOZILLA_AUDIENCE_SPECIFIC_WORKGROUPS_CHOICE_ID
-            ]
-          }
-        ]
-      }
-    ]
-  }, fileId);
-}
-
 // Add back conditional formatting on sheets with target limits
 function addCharacterLimitConditionalFormatting(sheet, numRows, numCols) {
   if (numRows < 2 || numCols < 4) {
