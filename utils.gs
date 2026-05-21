@@ -29,20 +29,48 @@ Drive helpers:
 Reporting:
 - createRunReport / recordEvent / recordError / sendSlackReport: per-run
   collection and Slack posting.
+- markVisited + per-entry dedup keys persist notification state across runs
+  in PropertiesService, so a stuck file doesn't re-fire its error every 15
+  minutes. When the underlying issue clears, the next run posts a "Resolved"
+  line and forgets the state.
 
 If SLACK_WEBHOOK_URL (defined in config.gs) is missing or empty, Slack posting
 is skipped silently.
 */
 
-const SCRIPT_LOCK_TIMEOUT_MS = 30 * 1000;
+const SCRIPT_LOCK_TIMEOUT_MS = 7 * 1000;
+
+// Cross-run dedup state for Slack notifications. Keyed by entry-point label,
+// then by per-error/event dedup key. See filterReportAgainstState.
+const NOTIFICATION_STATE_PROPERTY = 'notification_state_v1';
+const NOTIFICATION_STATE_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
 
 function runWithReport(label, fn) {
   const report = createRunReport();
+  let runCompleted = false;
 
   try {
-    withScriptLock(() => fn(report));
+    withScriptLock(() => {
+      fn(report);
+      runCompleted = true;
+    });
   } finally {
-    sendSlackReport(report, label);
+    if (runCompleted) {
+      const state = loadNotificationState();
+      const { filteredReport, resolved } = filterReportAgainstState(
+        report,
+        label,
+        state
+      );
+      reconcileState(state, label, report);
+      pruneExpiredState(state, NOTIFICATION_STATE_MAX_AGE_MS);
+      saveNotificationState(state);
+      sendSlackReport(filteredReport, label, resolved);
+    } else {
+      // Lock not acquired or fn threw before completion — don't mutate state.
+      // Send whatever was collected, unfiltered, so partial failures are visible.
+      sendSlackReport(report, label, []);
+    }
   }
 }
 
@@ -72,7 +100,11 @@ function processBatch(folder, mimeType, report, perFileFn) {
     try {
       perFileFn(file, report);
     } catch (error) {
-      recordError(report, `ERROR processing ${file.getName()}: ${error}`);
+      recordError(
+        report,
+        `ERROR processing ${file.getName()}: ${error}`,
+        `batch-error:${file.getId()}`
+      );
     }
   }
 }
@@ -101,16 +133,162 @@ function splitLocaleFromName(fileName) {
 }
 
 function createRunReport() {
-  return { events: [], errors: [] };
+  return { events: [], errors: [], visited: new Set() };
 }
 
-function recordEvent(report, kind, name, url) {
-  report.events.push({ kind, name, url });
+// `dedupKey`: opt-in stickiness. Events without a key are one-shot (the
+// common case — "Sheet created", "CSV moved") and post every time.
+function recordEvent(report, kind, name, url, dedupKey) {
+  report.events.push({ kind, name, url, dedupKey: dedupKey || null });
 }
 
-function recordError(report, message) {
-  report.errors.push(message);
+// `dedupKey`: errors default to hash-based dedup so even un-keyed sites
+// stop spamming. Pass a stable key (e.g. "formatting-error:<fileId>") when
+// you have one — message text can drift between runs without re-firing.
+function recordError(report, message, dedupKey) {
+  const key = dedupKey || `message-hash:${hashString(message)}`;
+  report.errors.push({ message, dedupKey: key });
   console.error(message);
+}
+
+// Declare that this run looked at `dedupKey` — required for resolution
+// detection. Without it, a missing key could mean "fixed" or "not examined",
+// and we'd risk posting spurious "Resolved" lines.
+function markVisited(report, dedupKey) {
+  if (dedupKey) {
+    report.visited.add(dedupKey);
+  }
+}
+
+function loadNotificationState() {
+  try {
+    const raw = PropertiesService.getScriptProperties().getProperty(
+      NOTIFICATION_STATE_PROPERTY
+    );
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch (error) {
+    console.error(`Failed to parse notification state; resetting: ${error}`);
+    return {};
+  }
+}
+
+function saveNotificationState(state) {
+  try {
+    PropertiesService.getScriptProperties().setProperty(
+      NOTIFICATION_STATE_PROPERTY,
+      JSON.stringify(state)
+    );
+  } catch (error) {
+    console.error(`Failed to save notification state: ${error}`);
+  }
+}
+
+function filterReportAgainstState(report, label, state) {
+  const labelState = state[label] || {};
+
+  const currentKeys = new Set();
+  const filteredErrors = [];
+  const filteredEvents = [];
+
+  for (const error of report.errors) {
+    currentKeys.add(error.dedupKey);
+    if (!labelState[error.dedupKey]) {
+      filteredErrors.push(error);
+    }
+  }
+
+  for (const event of report.events) {
+    if (!event.dedupKey) {
+      filteredEvents.push(event);
+      continue;
+    }
+    currentKeys.add(event.dedupKey);
+    if (!labelState[event.dedupKey]) {
+      filteredEvents.push(event);
+    }
+  }
+
+  // Resolution: a stored key is "resolved" only if this run examined the
+  // thing it refers to (visited) and didn't re-record it. Otherwise the
+  // file might simply not have been processed this run.
+  const resolved = [];
+  for (const key of Object.keys(labelState)) {
+    if (!currentKeys.has(key) && report.visited.has(key)) {
+      const entry = labelState[key];
+      resolved.push({ kind: entry.kind, message: entry.message });
+    }
+  }
+
+  return {
+    filteredReport: { events: filteredEvents, errors: filteredErrors },
+    resolved
+  };
+}
+
+function reconcileState(state, label, report) {
+  if (!state[label]) {
+    state[label] = {};
+  }
+  const labelState = state[label];
+  const now = new Date().toISOString();
+
+  const currentKeys = new Set();
+
+  for (const error of report.errors) {
+    currentKeys.add(error.dedupKey);
+    const existing = labelState[error.dedupKey];
+    labelState[error.dedupKey] = {
+      kind: 'error',
+      message: error.message,
+      firstNotifiedAt: existing ? existing.firstNotifiedAt : now,
+      lastSeenAt: now
+    };
+  }
+
+  for (const event of report.events) {
+    if (!event.dedupKey) continue;
+    currentKeys.add(event.dedupKey);
+    const existing = labelState[event.dedupKey];
+    labelState[event.dedupKey] = {
+      kind: event.kind,
+      message: `${event.kind}: ${event.name}`,
+      firstNotifiedAt: existing ? existing.firstNotifiedAt : now,
+      lastSeenAt: now
+    };
+  }
+
+  for (const key of Object.keys(labelState)) {
+    if (!currentKeys.has(key) && report.visited.has(key)) {
+      delete labelState[key];
+    }
+  }
+}
+
+function pruneExpiredState(state, maxAgeMs) {
+  const cutoff = Date.now() - maxAgeMs;
+
+  for (const label of Object.keys(state)) {
+    const labelState = state[label];
+    for (const key of Object.keys(labelState)) {
+      const entry = labelState[key];
+      if (new Date(entry.lastSeenAt).getTime() < cutoff) {
+        delete labelState[key];
+      }
+    }
+    if (Object.keys(labelState).length === 0) {
+      delete state[label];
+    }
+  }
+}
+
+function hashString(str) {
+  const bytes = Utilities.computeDigest(
+    Utilities.DigestAlgorithm.MD5,
+    String(str || '')
+  );
+  return bytes.map(b => ('0' + (b & 0xff).toString(16)).slice(-2)).join('');
 }
 
 const EN_COPY_HEADER = 'EN Copy';
@@ -253,21 +431,32 @@ function removeExistingFilesWithName(folder, name, mimeType) {
   }
 }
 
-function sendSlackReport(report, runLabel) {
+function sendSlackReport(report, runLabel, resolved) {
   if (typeof SLACK_WEBHOOK_URL === 'undefined' || !SLACK_WEBHOOK_URL) {
     Logger.log('SLACK_WEBHOOK_URL is not configured. Skipping Slack notification.');
     return;
   }
 
-  if (report.events.length === 0 && report.errors.length === 0) {
+  const resolvedList = resolved || [];
+
+  if (
+    report.events.length === 0 &&
+    report.errors.length === 0 &&
+    resolvedList.length === 0
+  ) {
     return;
   }
 
   const lines = [];
 
-  lines.push(
-    `*${runLabel}*: ${report.events.length} event(s), ${report.errors.length} error(s)`
-  );
+  const headerParts = [
+    `${report.events.length} event(s)`,
+    `${report.errors.length} error(s)`
+  ];
+  if (resolvedList.length > 0) {
+    headerParts.push(`${resolvedList.length} resolved`);
+  }
+  lines.push(`*${runLabel}*: ${headerParts.join(', ')}`);
 
   if (report.events.length > 0) {
     lines.push('', '*Events:*');
@@ -279,7 +468,14 @@ function sendSlackReport(report, runLabel) {
   if (report.errors.length > 0) {
     lines.push('', '*Errors:*');
     report.errors.forEach(e => {
-      lines.push(`• ${e}`);
+      lines.push(`• ${e.message}`);
+    });
+  }
+
+  if (resolvedList.length > 0) {
+    lines.push('', '*Resolved:*');
+    resolvedList.forEach(r => {
+      lines.push(`• ✓ [${r.kind}] ${r.message}`);
     });
   }
 

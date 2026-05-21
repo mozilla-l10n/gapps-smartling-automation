@@ -67,6 +67,8 @@ function processCsvFiles() {
 function processSingleCsvFile(folder, csvFile, report) {
   Logger.log(`Processing CSV: ${csvFile.getName()}`);
 
+  markVisited(report, `batch-error:${csvFile.getId()}`);
+
   applyMozillaAudienceIndicator(csvFile.getId());
 
   const { nameWithoutExtension: csvName, locale } = splitLocaleFromName(

@@ -95,11 +95,19 @@ function moveSingleDeliveredFile(
   report
 ) {
   const csvFileName = csvFile.getName();
+  const csvFileId = csvFile.getId();
   const { nameWithoutExtension: sheetFileName, base: baseFileName } =
     splitLocaleFromName(csvFileName);
 
   Logger.log(`Processing CSV: ${csvFileName}`);
   Logger.log(`Base filename: ${baseFileName}`);
+
+  // Claim ownership of dedup keys so prior notifications resolve if the
+  // corresponding issue no longer fires this run.
+  markVisited(report, `batch-error:${csvFileId}`);
+  markVisited(report, `no-source-match:${csvFileId}`);
+  markVisited(report, `missing-delivery:${csvFileId}`);
+  markVisited(report, `missing-generated-sheet:${csvFileId}`);
 
   const sourceMatch = getSourceMatch(
     baseFileName,
@@ -111,7 +119,8 @@ function moveSingleDeliveredFile(
   if (!sourceMatch) {
     recordError(
       report,
-      `No source Google Sheet match for "${baseFileName}" (CSV: ${csvFileName}).`
+      `No source Google Sheet match for "${baseFileName}" (CSV: ${csvFileName}).`,
+      `no-source-match:${csvFileId}`
     );
     return;
   }
@@ -131,7 +140,8 @@ function moveSingleDeliveredFile(
   if (!deliveryFolder) {
     recordError(
       report,
-      `Could not find Delivery folder under ${projectFolder.getUrl()} (CSV: ${csvFileName}).`
+      `Could not find Delivery folder under ${projectFolder.getUrl()} (CSV: ${csvFileName}).`,
+      `missing-delivery:${csvFileId}`
     );
     return;
   }
@@ -170,7 +180,8 @@ function moveSingleDeliveredFile(
   if (!generatedSheet) {
     recordError(
       report,
-      `Could not find generated Google Sheet named "${sheetFileName}" in source folder.`
+      `Could not find generated Google Sheet named "${sheetFileName}" in source folder.`,
+      `missing-generated-sheet:${csvFileId}`
     );
     return;
   }
@@ -200,10 +211,15 @@ function moveSingleDeliveredFile(
 
 function moveSingleDeliveredDoc(doc, destRootFolder, sourceMatchCache, report) {
   const docName = doc.getName();
+  const docId = doc.getId();
   const { base: baseFileName } = splitLocaleFromName(docName);
 
   Logger.log(`Processing Doc: ${docName}`);
   Logger.log(`Base filename: ${baseFileName}`);
+
+  markVisited(report, `batch-error:${docId}`);
+  markVisited(report, `no-source-match:${docId}`);
+  markVisited(report, `missing-delivery:${docId}`);
 
   const sourceMatch = getSourceMatch(
     baseFileName,
@@ -215,7 +231,8 @@ function moveSingleDeliveredDoc(doc, destRootFolder, sourceMatchCache, report) {
   if (!sourceMatch) {
     recordError(
       report,
-      `No source Google Doc match for "${baseFileName}" (Doc: ${docName}).`
+      `No source Google Doc match for "${baseFileName}" (Doc: ${docName}).`,
+      `no-source-match:${docId}`
     );
     return;
   }
@@ -234,7 +251,8 @@ function moveSingleDeliveredDoc(doc, destRootFolder, sourceMatchCache, report) {
   if (!deliveryFolder) {
     recordError(
       report,
-      `Could not find Delivery folder under ${projectFolder.getUrl()} (Doc: ${docName}).`
+      `Could not find Delivery folder under ${projectFolder.getUrl()} (Doc: ${docName}).`,
+      `missing-delivery:${docId}`
     );
     return;
   }

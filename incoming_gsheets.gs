@@ -101,10 +101,13 @@ function reportStrayRootFiles(root, report) {
 
   for (const mimeType of strayMimeTypes) {
     for (const file of collectFilesByType(root, mimeType)) {
+      const dedupKey = `stray-root:${file.getId()}`;
+      markVisited(report, dedupKey);
       recordError(
         report,
         `Stray file at INCOMING root: "${file.getName()}" (${file.getUrl()}). ` +
-          `Move it into a requester subfolder or delete it.`
+          `Move it into a requester subfolder or delete it.`,
+        dedupKey
       );
     }
   }
@@ -130,7 +133,11 @@ function processSheetsRecursively(folder, visited, report) {
     try {
       processSingleIncomingSheet(sheetFile, folder, report);
     } catch (error) {
-      recordError(report, `ERROR processing ${sheetFile.getName()}: ${error}`);
+      recordError(
+        report,
+        `ERROR processing ${sheetFile.getName()}: ${error}`,
+        `batch-error:${sheetFile.getId()}`
+      );
     }
   }
 
@@ -159,11 +166,19 @@ function collectFolders(folder) {
 
 function processSingleIncomingSheet(sheetFile, parentFolder, report) {
   const sheetName = sheetFile.getName();
+  const sheetId = sheetFile.getId();
   Logger.log(
     `Processing GSheet: ${sheetName} (folder: ${parentFolder.getName()})`
   );
 
-  const spreadsheet = SpreadsheetApp.openById(sheetFile.getId());
+  // Claim ownership of these dedup keys so prior notifications can resolve
+  // if this run doesn't re-record them.
+  markVisited(report, `batch-error:${sheetId}`);
+  markVisited(report, `no-grandparent:${sheetId}`);
+  markVisited(report, `formatting-error:${sheetId}`);
+  markVisited(report, `char-limit-warning:${sheetId}`);
+
+  const spreadsheet = SpreadsheetApp.openById(sheetId);
   const sheet = spreadsheet.getSheets()[0];
 
   if (sheet.getName().trim().toLowerCase() !== REQUEST_TAB_NAME) {
@@ -192,7 +207,8 @@ function processSingleIncomingSheet(sheetFile, parentFolder, report) {
   if (!layout) {
     recordError(
       report,
-      `Cannot organize ${sheetName}: parent folder "${parentFolder.getName()}" has no grandparent (expected a request folder above Source).`
+      `Cannot organize ${sheetName}: parent folder "${parentFolder.getName()}" has no grandparent (expected a request folder above Source).`,
+      `no-grandparent:${sheetId}`
     );
     return;
   }
@@ -245,7 +261,8 @@ function processSingleIncomingSheet(sheetFile, parentFolder, report) {
   if (errors.length > 0) {
     recordError(
       report,
-      `Cannot convert ${sheetName} (${spreadsheet.getUrl()}): ${summarizeFormattingErrors(errors)}`
+      `Cannot convert ${sheetName} (${spreadsheet.getUrl()}): ${summarizeFormattingErrors(errors)}`,
+      `formatting-error:${sheetId}`
     );
     return;
   }
@@ -257,7 +274,8 @@ function processSingleIncomingSheet(sheetFile, parentFolder, report) {
       report,
       'CSV warnings',
       `${sheetName} - ${warningSummary}`,
-      spreadsheet.getUrl()
+      spreadsheet.getUrl(),
+      `char-limit-warning:${sheetId}`
     );
   }
 
