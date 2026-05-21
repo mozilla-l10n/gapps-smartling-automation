@@ -8,9 +8,9 @@ Order matches the natural data flow:
   3. moveAllDelivered      - completed CSV/Sheet pairs -> Delivery folders.
 
 Each step still acquires its own script lock and posts its own Slack summary
-via runWithReport (utils.gs). Manual invocation of the individual entry
-points (processIncomingSheets, processCsvFiles, moveAllDelivered) continues
-to work for ad-hoc runs or debugging.
+via Shared.runWithReport (utils.gs). Manual invocation of the individual
+entry points (processIncomingSheets, processCsvFiles, moveAllDelivered)
+continues to work for ad-hoc runs or debugging.
 
 To deploy: point a single time-based trigger at `runAll` and remove the
 three per-step triggers.
@@ -24,6 +24,7 @@ function runAll() {
   ];
 
   for (const step of steps) {
+    Logger.log(`runAll: starting ${step.name}`);
     try {
       step.fn();
     } catch (error) {

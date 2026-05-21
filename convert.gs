@@ -32,8 +32,9 @@ Reporting:
   regenerations, and errors is posted to that Slack webhook at the end of each
   run. If empty, posting is skipped.
 
-Shared helpers (locking, reporting, batch iteration, locale parsing) live in
-utils.gs.
+`processCsvFiles` is the top-level entry point and is visible in the Apps
+Script picker. Internal helpers live on the `Convert` namespace so they don't
+clutter the picker. Cross-file helpers come from `Shared` (utils.gs).
 
 Required configuration (defined in config.gs):
   SOURCE_FOLDER_ID - Drive folder containing the CSVs.
@@ -46,207 +47,209 @@ const COLUMN_WIDTH = 220;
 const SURVEY_COLUMN_WIDTH = 400;
 const HEADER_COLOR = '#f9cb9c';
 
-// Survey template (first column "Key"): the "Translation" column is always
-// dropped, and columns are rendered wider (SURVEY_COLUMN_WIDTH). Loose check
-// kept here on purpose — Smartling-produced CSVs may include extra columns
-// that the strict utils.gs detectTemplate would not classify as survey.
-function isSurveyTemplate(values) {
-  return values.length > 0 && values[0][0] === KEY_HEADER;
-}
-
 function processCsvFiles() {
-  runWithReport('processCsvFiles', report => {
+  Shared.runWithReport('processCsvFiles', report => {
     const folder = DriveApp.getFolderById(SOURCE_FOLDER_ID);
 
-    processBatch(folder, MimeType.CSV, report, (csvFile, r) =>
-      processSingleCsvFile(folder, csvFile, r)
+    Shared.processBatch(folder, MimeType.CSV, report, (csvFile, r) =>
+      Convert.processSingleCsvFile(folder, csvFile, r)
     );
   });
 }
 
-function processSingleCsvFile(folder, csvFile, report) {
-  Logger.log(`Processing CSV: ${csvFile.getName()}`);
+const Convert = {
+  // Survey template (first column "Key"): the "Translation" column is always
+  // dropped, and columns are rendered wider (SURVEY_COLUMN_WIDTH). Loose check
+  // kept here on purpose — Smartling-produced CSVs may include extra columns
+  // that the strict Shared.detectTemplate would not classify as survey.
+  isSurveyTemplate(values) {
+    return values.length > 0 && values[0][0] === KEY_HEADER;
+  },
 
-  markVisited(report, `batch-error:${csvFile.getId()}`);
+  processSingleCsvFile(folder, csvFile, report) {
+    Logger.log(`Processing CSV: ${csvFile.getName()}`);
 
-  applyMozillaAudienceIndicator(csvFile.getId());
+    Shared.markVisited(report, `batch-error:${csvFile.getId()}`);
 
-  const { nameWithoutExtension: csvName, locale } = splitLocaleFromName(
-    csvFile.getName()
-  );
+    Shared.applyMozillaAudienceIndicator(csvFile.getId());
 
-  const existingFile = findFileInFolderByName(
-    folder,
-    csvName,
-    MimeType.GOOGLE_SHEETS
-  );
-  let spreadsheet = existingFile
-    ? SpreadsheetApp.openById(existingFile.getId())
-    : null;
-  const created = !spreadsheet;
+    const { nameWithoutExtension: csvName, locale } = Shared.splitLocaleFromName(
+      csvFile.getName()
+    );
 
-  if (!spreadsheet) {
-    Logger.log(`No matching Sheet found. Creating: ${csvName}`);
+    const existingFile = Shared.findFileInFolderByName(
+      folder,
+      csvName,
+      MimeType.GOOGLE_SHEETS
+    );
+    let spreadsheet = existingFile
+      ? SpreadsheetApp.openById(existingFile.getId())
+      : null;
+    const created = !spreadsheet;
 
-    spreadsheet = SpreadsheetApp.create(csvName);
-    DriveApp.getFileById(spreadsheet.getId()).moveTo(folder);
-  } else {
-    Logger.log(`Matching Sheet found: ${spreadsheet.getName()}`);
+    if (!spreadsheet) {
+      Logger.log(`No matching Sheet found. Creating: ${csvName}`);
 
-    const sheetFile = DriveApp.getFileById(spreadsheet.getId());
-    const sheet = spreadsheet.getSheets()[0];
+      spreadsheet = SpreadsheetApp.create(csvName);
+      DriveApp.getFileById(spreadsheet.getId()).moveTo(folder);
+    } else {
+      Logger.log(`Matching Sheet found: ${spreadsheet.getName()}`);
 
-    const sheetHasContent = sheet.getLastRow() > 0 && sheet.getLastColumn() > 0;
+      const sheetFile = DriveApp.getFileById(spreadsheet.getId());
+      const sheet = spreadsheet.getSheets()[0];
 
-    if (
-      sheetHasContent &&
-      sheetFile.getLastUpdated() >= csvFile.getLastUpdated()
-    ) {
-      Logger.log(
-        `Skipping ${csvFile.getName()} because Sheet is already up to date.`
-      );
-      applyMozillaAudienceIndicator(spreadsheet.getId());
+      const sheetHasContent = sheet.getLastRow() > 0 && sheet.getLastColumn() > 0;
+
+      if (
+        sheetHasContent &&
+        sheetFile.getLastUpdated() >= csvFile.getLastUpdated()
+      ) {
+        Logger.log(
+          `Skipping ${csvFile.getName()} because Sheet is already up to date.`
+        );
+        Shared.applyMozillaAudienceIndicator(spreadsheet.getId());
+        return;
+      }
+
+      Logger.log(`Regenerating Sheet for ${csvFile.getName()}.`);
+    }
+
+    const csvContent = csvFile.getBlob().getDataAsString();
+    let values = Utilities.parseCsv(csvContent);
+
+    if (!values.length) {
+      Logger.log(`Skipping empty CSV: ${csvFile.getName()}`);
       return;
     }
 
-    Logger.log(`Regenerating Sheet for ${csvFile.getName()}.`);
-  }
+    const survey = Convert.isSurveyTemplate(values);
+    values = Convert.cleanTargetColumns(values, locale);
 
-  const csvContent = csvFile.getBlob().getDataAsString();
-  let values = Utilities.parseCsv(csvContent);
+    const sheet = spreadsheet.getSheets()[0];
 
-  if (!values.length) {
-    Logger.log(`Skipping empty CSV: ${csvFile.getName()}`);
-    return;
-  }
+    sheet.clear();
+    sheet.clearConditionalFormatRules();
 
-  const survey = isSurveyTemplate(values);
-  values = cleanTargetColumns(values, locale);
+    sheet
+      .getRange(1, 1, values.length, values[0].length)
+      .setValues(values);
 
-  const sheet = spreadsheet.getSheets()[0];
-
-  sheet.clear();
-  sheet.clearConditionalFormatRules();
-
-  sheet
-    .getRange(1, 1, values.length, values[0].length)
-    .setValues(values);
-
-  formatSheet(
-    sheet,
-    values.length,
-    values[0].length,
-    survey ? SURVEY_COLUMN_WIDTH : COLUMN_WIDTH
-  );
-
-  applyMozillaAudienceIndicator(spreadsheet.getId());
-
-  recordEvent(
-    report,
-    created ? 'Sheet created' : 'Sheet regenerated',
-    csvName,
-    spreadsheet.getUrl()
-  );
-
-  Logger.log(`Finished processing ${csvFile.getName()}`);
-}
-
-function cleanTargetColumns(values, locale) {
-  const survey = isSurveyTemplate(values);
-
-  Logger.log(
-    `Template detected: ${survey ? 'survey' : 'standard'} ` +
-      `(first column header: ${JSON.stringify(values[0][0])})`
-  );
-
-  if (survey) {
-    values = dropColumnByHeader(values, TRANSLATION_HEADER);
-  } else {
-    values = dropRedundantTargetColumn(
-      values,
-      EN_COPY_HEADER,
-      TARGET_LANGUAGE_HEADER
+    Convert.formatSheet(
+      sheet,
+      values.length,
+      values[0].length,
+      survey ? SURVEY_COLUMN_WIDTH : COLUMN_WIDTH
     );
-  }
 
-  if (locale && values[0].length > 0) {
-    values[0][values[0].length - 1] = locale;
-  }
+    Shared.applyMozillaAudienceIndicator(spreadsheet.getId());
 
-  return values;
-}
+    Shared.recordEvent(
+      report,
+      created ? 'Sheet created' : 'Sheet regenerated',
+      csvName,
+      spreadsheet.getUrl()
+    );
 
-// If every row's targetHeader cell equals the corresponding sourceHeader cell,
-// drop the targetHeader column. Returns the original values otherwise.
-function dropRedundantTargetColumn(values, sourceHeader, targetHeader) {
-  const headers = values[0];
-  const sourceIdx = headers.indexOf(sourceHeader);
-  const targetIdx = headers.indexOf(targetHeader);
+    Logger.log(`Finished processing ${csvFile.getName()}`);
+  },
 
-  if (sourceIdx === -1 || targetIdx === -1) {
+  cleanTargetColumns(values, locale) {
+    const survey = Convert.isSurveyTemplate(values);
+
+    Logger.log(
+      `Template detected: ${survey ? 'survey' : 'standard'} ` +
+        `(first column header: ${JSON.stringify(values[0][0])})`
+    );
+
+    if (survey) {
+      values = Convert.dropColumnByHeader(values, TRANSLATION_HEADER);
+    } else {
+      values = Convert.dropRedundantTargetColumn(
+        values,
+        EN_COPY_HEADER,
+        TARGET_LANGUAGE_HEADER
+      );
+    }
+
+    if (locale && values[0].length > 0) {
+      values[0][values[0].length - 1] = locale;
+    }
+
     return values;
+  },
+
+  // If every row's targetHeader cell equals the corresponding sourceHeader
+  // cell, drop the targetHeader column. Returns the original values otherwise.
+  dropRedundantTargetColumn(values, sourceHeader, targetHeader) {
+    const headers = values[0];
+    const sourceIdx = headers.indexOf(sourceHeader);
+    const targetIdx = headers.indexOf(targetHeader);
+
+    if (sourceIdx === -1 || targetIdx === -1) {
+      return values;
+    }
+
+    const targetMatchesSource = values.slice(1).every(
+      row => Convert.normalizeCell(row[targetIdx]) === Convert.normalizeCell(row[sourceIdx])
+    );
+
+    if (!targetMatchesSource) {
+      return values;
+    }
+
+    return Convert.dropColumnByHeader(values, targetHeader);
+  },
+
+  // Drops the column whose header equals `header`. Returns values unchanged if
+  // no such column exists.
+  dropColumnByHeader(values, header) {
+    const idx = values[0].indexOf(header);
+
+    if (idx === -1) {
+      return values;
+    }
+
+    return values.map(row => row.filter((_, i) => i !== idx));
+  },
+
+  normalizeCell(value) {
+    return String(value || '').trim();
+  },
+
+  formatSheet(sheet, numRows, numCols, columnWidth) {
+    sheet.getRange(1, 1, numRows, numCols)
+      .setVerticalAlignment('top')
+      .setWrap(true);
+
+    sheet.getRange(1, 1, 1, numCols)
+      .setBackground(HEADER_COLOR)
+      .setFontWeight('bold');
+
+    sheet.setColumnWidths(1, numCols, columnWidth);
+    sheet.setFrozenRows(1);
+
+    Convert.addCharacterLimitConditionalFormatting(sheet, numRows, numCols);
+  },
+
+  // Conditional formatting that highlights target cells exceeding the
+  // "Target Character Limit" in column B.
+  addCharacterLimitConditionalFormatting(sheet, numRows, numCols) {
+    if (numRows < 2 || numCols < 4) {
+      return;
+    }
+
+    if (sheet.getRange(1, 2).getValue() !== TARGET_CHARACTER_LIMIT_HEADER) {
+      return;
+    }
+
+    const range = sheet.getRange(2, 1, numRows - 1, numCols);
+
+    const rule = SpreadsheetApp.newConditionalFormatRule()
+      .whenFormulaSatisfied('=LEN($D2)>$B2')
+      .setBackground('#f4cccc')
+      .setRanges([range])
+      .build();
+
+    sheet.setConditionalFormatRules([rule]);
   }
-
-  const targetMatchesSource = values.slice(1).every(
-    row => normalizeCell(row[targetIdx]) === normalizeCell(row[sourceIdx])
-  );
-
-  if (!targetMatchesSource) {
-    return values;
-  }
-
-  return dropColumnByHeader(values, targetHeader);
-}
-
-// Drops the column whose header equals `header`. Returns values unchanged if
-// no such column exists.
-function dropColumnByHeader(values, header) {
-  const idx = values[0].indexOf(header);
-
-  if (idx === -1) {
-    return values;
-  }
-
-  return values.map(row => row.filter((_, i) => i !== idx));
-}
-
-function normalizeCell(value) {
-  return String(value || '').trim();
-}
-
-function formatSheet(sheet, numRows, numCols, columnWidth) {
-  sheet.getRange(1, 1, numRows, numCols)
-    .setVerticalAlignment('top')
-    .setWrap(true);
-
-  sheet.getRange(1, 1, 1, numCols)
-    .setBackground(HEADER_COLOR)
-    .setFontWeight('bold');
-
-  sheet.setColumnWidths(1, numCols, columnWidth);
-  sheet.setFrozenRows(1);
-
-  addCharacterLimitConditionalFormatting(sheet, numRows, numCols);
-}
-
-// Add target label to files (Mozilla audience) if not set yet
-// Add back conditional formatting on sheets with target limits
-function addCharacterLimitConditionalFormatting(sheet, numRows, numCols) {
-  if (numRows < 2 || numCols < 4) {
-    return;
-  }
-
-  if (sheet.getRange(1, 2).getValue() !== TARGET_CHARACTER_LIMIT_HEADER) {
-    return;
-  }
-
-  const range = sheet.getRange(2, 1, numRows - 1, numCols);
-
-  const rule = SpreadsheetApp.newConditionalFormatRule()
-    .whenFormulaSatisfied('=LEN($D2)>$B2')
-    .setBackground('#f4cccc')
-    .setRanges([range])
-    .build();
-
-  sheet.setConditionalFormatRules([rule]);
-}
+};

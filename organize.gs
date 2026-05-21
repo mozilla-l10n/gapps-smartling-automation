@@ -2,10 +2,11 @@
 Organize delivered translations from the Translation folder into per-project
 Delivery folders under DEST_FOLDER_ID.
 
-Entry points:
-  moveAllDelivered    - process both CSV/Sheet pairs and Docs in one run.
-  moveDeliveredFiles  - process only CSV/Sheet pairs.
-  moveDeliveredDocs   - process only Docs.
+`moveAllDelivered` is the top-level entry point and is visible in the Apps
+Script picker (processes both CSV/Sheet pairs and Docs in one run). The
+narrower variants (`moveDeliveredFiles` for CSVs only, `moveDeliveredDocs`
+for Docs only) and internal helpers live on the `Organize` namespace so they
+don't clutter the picker. Cross-file helpers come from `Shared` (utils.gs).
 
 CSV/Sheet flow (per CSV in SOURCE_FOLDER_ID):
 1. Determine BASE_FILENAME by stripping the locale suffix and .csv extension.
@@ -38,343 +39,341 @@ Reporting:
 - If SLACK_WEBHOOK_URL is set in config.gs, a per-run summary of events and
   errors is posted to that Slack webhook. If empty, posting is skipped.
 
-Shared helpers (locking, reporting, batch iteration, locale parsing) live in
-utils.gs.
-
 Make sure to structure the request correctly and keep the same file name
 between Drive Connector and Source folder. Rename the original if needed.
 */
 
 // Process both CSVs and Google Docs in one run.
 function moveAllDelivered() {
-  runWithReport('moveAllDelivered', report => {
+  Shared.runWithReport('moveAllDelivered', report => {
     const sourceFolder = DriveApp.getFolderById(SOURCE_FOLDER_ID);
     const destRootFolder = DriveApp.getFolderById(DEST_FOLDER_ID);
 
     const csvCache = new Map();
-    processBatch(sourceFolder, MimeType.CSV, report, (csvFile, r) =>
-      moveSingleDeliveredFile(csvFile, sourceFolder, destRootFolder, csvCache, r)
+    Shared.processBatch(sourceFolder, MimeType.CSV, report, (csvFile, r) =>
+      Organize.moveSingleDeliveredFile(csvFile, sourceFolder, destRootFolder, csvCache, r)
     );
 
     const docCache = new Map();
-    processBatch(sourceFolder, MimeType.GOOGLE_DOCS, report, (doc, r) =>
-      moveSingleDeliveredDoc(doc, destRootFolder, docCache, r)
+    Shared.processBatch(sourceFolder, MimeType.GOOGLE_DOCS, report, (doc, r) =>
+      Organize.moveSingleDeliveredDoc(doc, destRootFolder, docCache, r)
     );
   });
 }
 
-function moveDeliveredFiles() {
-  runWithReport('moveDeliveredFiles', report => {
-    const sourceFolder = DriveApp.getFolderById(SOURCE_FOLDER_ID);
-    const destRootFolder = DriveApp.getFolderById(DEST_FOLDER_ID);
-    const cache = new Map();
+const Organize = {
+  moveDeliveredFiles() {
+    Shared.runWithReport('moveDeliveredFiles', report => {
+      const sourceFolder = DriveApp.getFolderById(SOURCE_FOLDER_ID);
+      const destRootFolder = DriveApp.getFolderById(DEST_FOLDER_ID);
+      const cache = new Map();
 
-    processBatch(sourceFolder, MimeType.CSV, report, (csvFile, r) =>
-      moveSingleDeliveredFile(csvFile, sourceFolder, destRootFolder, cache, r)
-    );
-  });
-}
+      Shared.processBatch(sourceFolder, MimeType.CSV, report, (csvFile, r) =>
+        Organize.moveSingleDeliveredFile(csvFile, sourceFolder, destRootFolder, cache, r)
+      );
+    });
+  },
 
-function moveDeliveredDocs() {
-  runWithReport('moveDeliveredDocs', report => {
-    const sourceFolder = DriveApp.getFolderById(SOURCE_FOLDER_ID);
-    const destRootFolder = DriveApp.getFolderById(DEST_FOLDER_ID);
-    const cache = new Map();
+  moveDeliveredDocs() {
+    Shared.runWithReport('moveDeliveredDocs', report => {
+      const sourceFolder = DriveApp.getFolderById(SOURCE_FOLDER_ID);
+      const destRootFolder = DriveApp.getFolderById(DEST_FOLDER_ID);
+      const cache = new Map();
 
-    processBatch(sourceFolder, MimeType.GOOGLE_DOCS, report, (doc, r) =>
-      moveSingleDeliveredDoc(doc, destRootFolder, cache, r)
-    );
-  });
-}
+      Shared.processBatch(sourceFolder, MimeType.GOOGLE_DOCS, report, (doc, r) =>
+        Organize.moveSingleDeliveredDoc(doc, destRootFolder, cache, r)
+      );
+    });
+  },
 
-function moveSingleDeliveredFile(
-  csvFile,
-  sourceFolder,
-  destRootFolder,
-  sourceMatchCache,
-  report
-) {
-  const csvFileName = csvFile.getName();
-  const csvFileId = csvFile.getId();
-  const { nameWithoutExtension: sheetFileName, base: baseFileName } =
-    splitLocaleFromName(csvFileName);
-
-  Logger.log(`Processing CSV: ${csvFileName}`);
-  Logger.log(`Base filename: ${baseFileName}`);
-
-  // Claim ownership of dedup keys so prior notifications resolve if the
-  // corresponding issue no longer fires this run.
-  markVisited(report, `batch-error:${csvFileId}`);
-  markVisited(report, `no-source-match:${csvFileId}`);
-  markVisited(report, `missing-delivery:${csvFileId}`);
-  markVisited(report, `missing-generated-sheet:${csvFileId}`);
-
-  const sourceMatch = getSourceMatch(
-    baseFileName,
+  moveSingleDeliveredFile(
+    csvFile,
+    sourceFolder,
     destRootFolder,
     sourceMatchCache,
-    MimeType.GOOGLE_SHEETS
-  );
+    report
+  ) {
+    const csvFileName = csvFile.getName();
+    const csvFileId = csvFile.getId();
+    const { nameWithoutExtension: sheetFileName, base: baseFileName } =
+      Shared.splitLocaleFromName(csvFileName);
 
-  if (!sourceMatch) {
-    recordError(
-      report,
-      `No source Google Sheet match for "${baseFileName}" (CSV: ${csvFileName}).`,
-      `no-source-match:${csvFileId}`
+    Logger.log(`Processing CSV: ${csvFileName}`);
+    Logger.log(`Base filename: ${baseFileName}`);
+
+    // Claim ownership of dedup keys so prior notifications resolve if the
+    // corresponding issue no longer fires this run.
+    Shared.markVisited(report, `batch-error:${csvFileId}`);
+    Shared.markVisited(report, `no-source-match:${csvFileId}`);
+    Shared.markVisited(report, `missing-delivery:${csvFileId}`);
+    Shared.markVisited(report, `missing-generated-sheet:${csvFileId}`);
+
+    const sourceMatch = Organize.getSourceMatch(
+      baseFileName,
+      destRootFolder,
+      sourceMatchCache,
+      MimeType.GOOGLE_SHEETS
     );
-    return;
-  }
 
-  const sourceReferenceFolder = sourceMatch.sourceFolder;
-  const projectFolder = sourceMatch.projectFolder;
+    if (!sourceMatch) {
+      Shared.recordError(
+        report,
+        `No source Google Sheet match for "${baseFileName}" (CSV: ${csvFileName}).`,
+        `no-source-match:${csvFileId}`
+      );
+      return;
+    }
 
-  Logger.log(
-    `Reference Sheet found in Source folder: ${sourceReferenceFolder.getUrl()}`
-  );
-
-  const deliveryFolder = findChildFolderByNameCaseInsensitive(
-    projectFolder,
-    'Delivery'
-  );
-
-  if (!deliveryFolder) {
-    recordError(
-      report,
-      `Could not find Delivery folder under ${projectFolder.getUrl()} (CSV: ${csvFileName}).`,
-      `missing-delivery:${csvFileId}`
-    );
-    return;
-  }
-
-  let deliveryToCustomerFolder = findChildFolderByNameCaseInsensitive(
-    deliveryFolder,
-    'Delivery to Customer'
-  );
-
-  let originalFolder = findChildFolderByNameCaseInsensitive(
-    deliveryFolder,
-    'Original'
-  );
-
-  if (!deliveryToCustomerFolder) {
-    deliveryToCustomerFolder =
-      deliveryFolder.createFolder('Delivery to Customer');
+    const sourceReferenceFolder = sourceMatch.sourceFolder;
+    const projectFolder = sourceMatch.projectFolder;
 
     Logger.log(
-      `Created folder "Delivery to Customer": ${deliveryToCustomerFolder.getUrl()}`
+      `Reference Sheet found in Source folder: ${sourceReferenceFolder.getUrl()}`
     );
-  }
 
-  if (!originalFolder) {
-    originalFolder = deliveryFolder.createFolder('Original');
+    const deliveryFolder = Shared.findChildFolderByNameCaseInsensitive(
+      projectFolder,
+      'Delivery'
+    );
 
-    Logger.log(`Created folder "Original": ${originalFolder.getUrl()}`);
-  }
+    if (!deliveryFolder) {
+      Shared.recordError(
+        report,
+        `Could not find Delivery folder under ${projectFolder.getUrl()} (CSV: ${csvFileName}).`,
+        `missing-delivery:${csvFileId}`
+      );
+      return;
+    }
 
-  const generatedSheet = findFileInFolderByName(
-    sourceFolder,
-    sheetFileName,
-    MimeType.GOOGLE_SHEETS
-  );
+    let deliveryToCustomerFolder = Shared.findChildFolderByNameCaseInsensitive(
+      deliveryFolder,
+      'Delivery to Customer'
+    );
 
-  if (!generatedSheet) {
-    recordError(
+    let originalFolder = Shared.findChildFolderByNameCaseInsensitive(
+      deliveryFolder,
+      'Original'
+    );
+
+    if (!deliveryToCustomerFolder) {
+      deliveryToCustomerFolder =
+        deliveryFolder.createFolder('Delivery to Customer');
+
+      Logger.log(
+        `Created folder "Delivery to Customer": ${deliveryToCustomerFolder.getUrl()}`
+      );
+    }
+
+    if (!originalFolder) {
+      originalFolder = deliveryFolder.createFolder('Original');
+
+      Logger.log(`Created folder "Original": ${originalFolder.getUrl()}`);
+    }
+
+    const generatedSheet = Shared.findFileInFolderByName(
+      sourceFolder,
+      sheetFileName,
+      MimeType.GOOGLE_SHEETS
+    );
+
+    if (!generatedSheet) {
+      Shared.recordError(
+        report,
+        `Could not find generated Google Sheet named "${sheetFileName}" in source folder.`,
+        `missing-generated-sheet:${csvFileId}`
+      );
+      return;
+    }
+
+    Shared.removeExistingFilesWithName(
+      deliveryToCustomerFolder,
+      generatedSheet.getName()
+    );
+    generatedSheet.moveTo(deliveryToCustomerFolder);
+    Shared.recordEvent(
       report,
-      `Could not find generated Google Sheet named "${sheetFileName}" in source folder.`,
-      `missing-generated-sheet:${csvFileId}`
+      'Sheet moved',
+      generatedSheet.getName(),
+      deliveryToCustomerFolder.getUrl()
     );
-    return;
-  }
 
-  removeExistingFilesWithName(
-    deliveryToCustomerFolder,
-    generatedSheet.getName()
-  );
-  generatedSheet.moveTo(deliveryToCustomerFolder);
-  recordEvent(
-    report,
-    'Sheet moved',
-    generatedSheet.getName(),
-    deliveryToCustomerFolder.getUrl()
-  );
+    Logger.log(
+      `Moved Sheet "${generatedSheet.getName()}" to: ${deliveryToCustomerFolder.getUrl()}`
+    );
 
-  Logger.log(
-    `Moved Sheet "${generatedSheet.getName()}" to: ${deliveryToCustomerFolder.getUrl()}`
-  );
+    Shared.removeExistingFilesWithName(originalFolder, csvFile.getName());
+    csvFile.moveTo(originalFolder);
+    Shared.recordEvent(report, 'CSV moved', csvFile.getName(), originalFolder.getUrl());
 
-  removeExistingFilesWithName(originalFolder, csvFile.getName());
-  csvFile.moveTo(originalFolder);
-  recordEvent(report, 'CSV moved', csvFile.getName(), originalFolder.getUrl());
+    Logger.log(`Moved CSV "${csvFile.getName()}" to: ${originalFolder.getUrl()}`);
+  },
 
-  Logger.log(`Moved CSV "${csvFile.getName()}" to: ${originalFolder.getUrl()}`);
-}
+  moveSingleDeliveredDoc(doc, destRootFolder, sourceMatchCache, report) {
+    const docName = doc.getName();
+    const docId = doc.getId();
+    const { base: baseFileName } = Shared.splitLocaleFromName(docName);
 
-function moveSingleDeliveredDoc(doc, destRootFolder, sourceMatchCache, report) {
-  const docName = doc.getName();
-  const docId = doc.getId();
-  const { base: baseFileName } = splitLocaleFromName(docName);
+    Logger.log(`Processing Doc: ${docName}`);
+    Logger.log(`Base filename: ${baseFileName}`);
 
-  Logger.log(`Processing Doc: ${docName}`);
-  Logger.log(`Base filename: ${baseFileName}`);
+    Shared.markVisited(report, `batch-error:${docId}`);
+    Shared.markVisited(report, `no-source-match:${docId}`);
+    Shared.markVisited(report, `missing-delivery:${docId}`);
 
-  markVisited(report, `batch-error:${docId}`);
-  markVisited(report, `no-source-match:${docId}`);
-  markVisited(report, `missing-delivery:${docId}`);
+    const sourceMatch = Organize.getSourceMatch(
+      baseFileName,
+      destRootFolder,
+      sourceMatchCache,
+      MimeType.GOOGLE_DOCS
+    );
 
-  const sourceMatch = getSourceMatch(
+    if (!sourceMatch) {
+      Shared.recordError(
+        report,
+        `No source Google Doc match for "${baseFileName}" (Doc: ${docName}).`,
+        `no-source-match:${docId}`
+      );
+      return;
+    }
+
+    const projectFolder = sourceMatch.projectFolder;
+
+    Logger.log(
+      `Reference Doc found in Source folder: ${sourceMatch.sourceFolder.getUrl()}`
+    );
+
+    const deliveryFolder = Shared.findChildFolderByNameCaseInsensitive(
+      projectFolder,
+      'Delivery'
+    );
+
+    if (!deliveryFolder) {
+      Shared.recordError(
+        report,
+        `Could not find Delivery folder under ${projectFolder.getUrl()} (Doc: ${docName}).`,
+        `missing-delivery:${docId}`
+      );
+      return;
+    }
+
+    Shared.removeExistingFilesWithName(deliveryFolder, docName);
+    doc.moveTo(deliveryFolder);
+    Shared.recordEvent(report, 'Doc moved', docName, deliveryFolder.getUrl());
+
+    Logger.log(`Moved Doc "${docName}" to: ${deliveryFolder.getUrl()}`);
+  },
+
+  getSourceMatch(
     baseFileName,
     destRootFolder,
     sourceMatchCache,
-    MimeType.GOOGLE_DOCS
-  );
-
-  if (!sourceMatch) {
-    recordError(
-      report,
-      `No source Google Doc match for "${baseFileName}" (Doc: ${docName}).`,
-      `no-source-match:${docId}`
-    );
-    return;
-  }
-
-  const projectFolder = sourceMatch.projectFolder;
-
-  Logger.log(
-    `Reference Doc found in Source folder: ${sourceMatch.sourceFolder.getUrl()}`
-  );
-
-  const deliveryFolder = findChildFolderByNameCaseInsensitive(
-    projectFolder,
-    'Delivery'
-  );
-
-  if (!deliveryFolder) {
-    recordError(
-      report,
-      `Could not find Delivery folder under ${projectFolder.getUrl()} (Doc: ${docName}).`,
-      `missing-delivery:${docId}`
-    );
-    return;
-  }
-
-  removeExistingFilesWithName(deliveryFolder, docName);
-  doc.moveTo(deliveryFolder);
-  recordEvent(report, 'Doc moved', docName, deliveryFolder.getUrl());
-
-  Logger.log(`Moved Doc "${docName}" to: ${deliveryFolder.getUrl()}`);
-}
-
-function getSourceMatch(
-  baseFileName,
-  destRootFolder,
-  sourceMatchCache,
-  mimeType
-) {
-  if (sourceMatchCache.has(baseFileName)) {
-    return sourceMatchCache.get(baseFileName);
-  }
-
-  const match = searchSourceMatch(baseFileName, destRootFolder, mimeType);
-  sourceMatchCache.set(baseFileName, match);
-  return match;
-}
-
-function searchSourceMatch(baseFileName, destRootFolder, mimeType) {
-  Logger.log(
-    `Searching for file named "${baseFileName}" (mimeType: ${mimeType}).`
-  );
-
-  const escapedName = baseFileName
-    .replace(/\\/g, '\\\\')
-    .replace(/'/g, "\\'");
-
-  const query =
-    `title = '${escapedName}' and ` +
-    `mimeType = '${mimeType}' and ` +
-    `trashed = false`;
-
-  const files = DriveApp.searchFiles(query);
-  const matches = [];
-  const descendantCache = new Map();
-
-  while (files.hasNext()) {
-    const file = files.next();
-
-    if (file.getName() !== baseFileName) {
-      continue;
+    mimeType
+  ) {
+    if (sourceMatchCache.has(baseFileName)) {
+      return sourceMatchCache.get(baseFileName);
     }
 
-    const parent = getFirstParent(file);
+    const match = Organize.searchSourceMatch(baseFileName, destRootFolder, mimeType);
+    sourceMatchCache.set(baseFileName, match);
+    return match;
+  },
 
-    if (!parent) {
-      continue;
-    }
-
-    if (parent.getName().toLowerCase() !== 'source') {
-      continue;
-    }
-
-    if (!isDescendantOf(parent, destRootFolder, descendantCache)) {
-      continue;
-    }
-
-    matches.push({ file, sourceFolder: parent });
-  }
-
-  if (matches.length === 0) {
-    console.error(
-      `Could not find file named "${baseFileName}" (mimeType: ${mimeType}) in any Source folder under destination root.`
-    );
-    return null;
-  }
-
-  if (matches.length > 1) {
-    console.warn(
-      `Found multiple files named "${baseFileName}". Using the first one.`
+  searchSourceMatch(baseFileName, destRootFolder, mimeType) {
+    Logger.log(
+      `Searching for file named "${baseFileName}" (mimeType: ${mimeType}).`
     );
 
-    matches.forEach(m => {
-      Logger.log(`Match: ${m.file.getName()} - ${m.file.getUrl()}`);
-    });
-  }
+    const escapedName = baseFileName
+      .replace(/\\/g, '\\\\')
+      .replace(/'/g, "\\'");
 
-  const referenceFile = matches[0].file;
-  const sourceFolder = matches[0].sourceFolder;
-  const projectFolder = getFirstParent(sourceFolder);
+    const query =
+      `title = '${escapedName}' and ` +
+      `mimeType = '${mimeType}' and ` +
+      `trashed = false`;
 
-  if (!projectFolder) {
-    console.error(
-      `Could not find parent folder above Source for "${baseFileName}".`
-    );
-    return null;
-  }
+    const files = DriveApp.searchFiles(query);
+    const matches = [];
+    const descendantCache = new Map();
 
-  return {
-    referenceFile,
-    sourceFolder,
-    projectFolder
-  };
-}
+    while (files.hasNext()) {
+      const file = files.next();
 
-function isDescendantOf(folder, ancestor, cache) {
-  const ancestorId = ancestor.getId();
-  const startId = folder.getId();
+      if (file.getName() !== baseFileName) {
+        continue;
+      }
 
-  if (cache && cache.has(startId)) {
-    return cache.get(startId);
-  }
+      const parent = Shared.getFirstParent(file);
 
-  let current = folder;
-  while (current) {
-    if (current.getId() === ancestorId) {
-      if (cache) cache.set(startId, true);
-      return true;
+      if (!parent) {
+        continue;
+      }
+
+      if (parent.getName().toLowerCase() !== 'source') {
+        continue;
+      }
+
+      if (!Organize.isDescendantOf(parent, destRootFolder, descendantCache)) {
+        continue;
+      }
+
+      matches.push({ file, sourceFolder: parent });
     }
-    const parents = current.getParents();
-    current = parents.hasNext() ? parents.next() : null;
+
+    if (matches.length === 0) {
+      console.error(
+        `Could not find file named "${baseFileName}" (mimeType: ${mimeType}) in any Source folder under destination root.`
+      );
+      return null;
+    }
+
+    if (matches.length > 1) {
+      console.warn(
+        `Found multiple files named "${baseFileName}". Using the first one.`
+      );
+
+      matches.forEach(m => {
+        Logger.log(`Match: ${m.file.getName()} - ${m.file.getUrl()}`);
+      });
+    }
+
+    const referenceFile = matches[0].file;
+    const sourceFolder = matches[0].sourceFolder;
+    const projectFolder = Shared.getFirstParent(sourceFolder);
+
+    if (!projectFolder) {
+      console.error(
+        `Could not find parent folder above Source for "${baseFileName}".`
+      );
+      return null;
+    }
+
+    return {
+      referenceFile,
+      sourceFolder,
+      projectFolder
+    };
+  },
+
+  isDescendantOf(folder, ancestor, cache) {
+    const ancestorId = ancestor.getId();
+    const startId = folder.getId();
+
+    if (cache && cache.has(startId)) {
+      return cache.get(startId);
+    }
+
+    let current = folder;
+    while (current) {
+      if (current.getId() === ancestorId) {
+        if (cache) cache.set(startId, true);
+        return true;
+      }
+      const parents = current.getParents();
+      current = parents.hasNext() ? parents.next() : null;
+    }
+
+    if (cache) cache.set(startId, false);
+    return false;
   }
-
-  if (cache) cache.set(startId, false);
-  return false;
-}
-
+};

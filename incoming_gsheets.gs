@@ -49,8 +49,9 @@ Reporting:
   warnings, and errors is posted to that Slack webhook at the end of each
   run. If empty, posting is skipped.
 
-Shared helpers (locking, reporting, template detection, Drive helpers) live
-in utils.gs.
+`processIncomingSheets` is the top-level entry point and is visible in the
+Apps Script picker. Internal helpers live on the `Incoming` namespace.
+Cross-file helpers come from `Shared` (utils.gs).
 
 Required configuration (defined in config.gs):
   INCOMING_FOLDER_ID - Drive folder containing requester subfolders.
@@ -72,511 +73,513 @@ const ERROR_ROW_PREVIEW_LIMIT = 5;
 const DEFAULT_FOREGROUND_COLORS = new Set(['', '#000000', '#000']);
 
 function processIncomingSheets() {
-  runWithReport('processIncomingSheets', report => {
+  Shared.runWithReport('processIncomingSheets', report => {
     const root = DriveApp.getFolderById(INCOMING_FOLDER_ID);
     const visited = new Set();
 
-    reportStrayRootFiles(root, report);
+    Incoming.reportStrayRootFiles(root, report);
 
     // Walk each subfolder recursively. The root-level "Templates" folder is
     // reserved for reference templates and never holds real requests.
     const templatesName = TEMPLATES_FOLDER_NAME.toLowerCase();
 
-    for (const subfolder of collectFolders(root)) {
+    for (const subfolder of Incoming.collectFolders(root)) {
       if (subfolder.getName().trim().toLowerCase() === templatesName) {
         Logger.log(`Skipping root-level "${subfolder.getName()}" folder.`);
         continue;
       }
-      processSheetsRecursively(subfolder, visited, report);
+      Incoming.processSheetsRecursively(subfolder, visited, report);
     }
   });
 }
 
-// Requests and generated CSVs must live inside a requester subfolder, never
-// at the INCOMING root. Anything here is almost certainly a misplaced drop
-// the user needs to clean up — report each as an error. Other file types
-// (Docs, etc.) may be legitimate workspace files and are left alone.
-function reportStrayRootFiles(root, report) {
-  const strayMimeTypes = [MimeType.GOOGLE_SHEETS, MimeType.CSV];
+const Incoming = {
+  // Requests and generated CSVs must live inside a requester subfolder, never
+  // at the INCOMING root. Anything here is almost certainly a misplaced drop
+  // the user needs to clean up — report each as an error. Other file types
+  // (Docs, etc.) may be legitimate workspace files and are left alone.
+  reportStrayRootFiles(root, report) {
+    const strayMimeTypes = [MimeType.GOOGLE_SHEETS, MimeType.CSV];
 
-  for (const mimeType of strayMimeTypes) {
-    for (const file of collectFilesByType(root, mimeType)) {
-      const dedupKey = `stray-root:${file.getId()}`;
-      markVisited(report, dedupKey);
-      recordError(
-        report,
-        `Stray file at INCOMING root: "${file.getName()}" (${file.getUrl()}). ` +
-          `Move it into a requester subfolder or delete it.`,
-        dedupKey
-      );
+    for (const mimeType of strayMimeTypes) {
+      for (const file of Incoming.collectFilesByType(root, mimeType)) {
+        const dedupKey = `stray-root:${file.getId()}`;
+        Shared.markVisited(report, dedupKey);
+        Shared.recordError(
+          report,
+          `Stray file at INCOMING root: "${file.getName()}" (${file.getUrl()}). ` +
+            `Move it into a requester subfolder or delete it.`,
+          dedupKey
+        );
+      }
     }
-  }
-}
+  },
 
-function processSheetsRecursively(folder, visited, report) {
-  if (folder.getName().trim().toLowerCase() === DELIVERY_FOLDER_NAME.toLowerCase()) {
-    return;
-  }
-
-  // Snapshot files and subfolders before processing so that any new folders
-  // we create (Source / Delivery) and any moves we perform don't perturb the
-  // iteration we're currently inside.
-  const sheets = collectFilesByType(folder, MimeType.GOOGLE_SHEETS);
-  const subfolders = collectFolders(folder);
-
-  for (const sheetFile of sheets) {
-    if (visited.has(sheetFile.getId())) {
-      continue;
+  processSheetsRecursively(folder, visited, report) {
+    if (folder.getName().trim().toLowerCase() === DELIVERY_FOLDER_NAME.toLowerCase()) {
+      return;
     }
-    visited.add(sheetFile.getId());
 
-    try {
-      processSingleIncomingSheet(sheetFile, folder, report);
-    } catch (error) {
-      recordError(
-        report,
-        `ERROR processing ${sheetFile.getName()}: ${error}`,
-        `batch-error:${sheetFile.getId()}`
-      );
+    // Snapshot files and subfolders before processing so that any new folders
+    // we create (Source / Delivery) and any moves we perform don't perturb the
+    // iteration we're currently inside.
+    const sheets = Incoming.collectFilesByType(folder, MimeType.GOOGLE_SHEETS);
+    const subfolders = Incoming.collectFolders(folder);
+
+    for (const sheetFile of sheets) {
+      if (visited.has(sheetFile.getId())) {
+        continue;
+      }
+      visited.add(sheetFile.getId());
+
+      try {
+        Incoming.processSingleIncomingSheet(sheetFile, folder, report);
+      } catch (error) {
+        Shared.recordError(
+          report,
+          `ERROR processing ${sheetFile.getName()}: ${error}`,
+          `batch-error:${sheetFile.getId()}`
+        );
+      }
     }
-  }
 
-  for (const sub of subfolders) {
-    processSheetsRecursively(sub, visited, report);
-  }
-}
+    for (const sub of subfolders) {
+      Incoming.processSheetsRecursively(sub, visited, report);
+    }
+  },
 
-function collectFilesByType(folder, mimeType) {
-  const items = [];
-  const iter = folder.getFilesByType(mimeType);
-  while (iter.hasNext()) {
-    items.push(iter.next());
-  }
-  return items;
-}
+  collectFilesByType(folder, mimeType) {
+    const items = [];
+    const iter = folder.getFilesByType(mimeType);
+    while (iter.hasNext()) {
+      items.push(iter.next());
+    }
+    return items;
+  },
 
-function collectFolders(folder) {
-  const items = [];
-  const iter = folder.getFolders();
-  while (iter.hasNext()) {
-    items.push(iter.next());
-  }
-  return items;
-}
+  collectFolders(folder) {
+    const items = [];
+    const iter = folder.getFolders();
+    while (iter.hasNext()) {
+      items.push(iter.next());
+    }
+    return items;
+  },
 
-function processSingleIncomingSheet(sheetFile, parentFolder, report) {
-  const sheetName = sheetFile.getName();
-  const sheetId = sheetFile.getId();
-  Logger.log(
-    `Processing GSheet: ${sheetName} (folder: ${parentFolder.getName()})`
-  );
-
-  // Claim ownership of these dedup keys so prior notifications can resolve
-  // if this run doesn't re-record them.
-  markVisited(report, `batch-error:${sheetId}`);
-  markVisited(report, `no-grandparent:${sheetId}`);
-  markVisited(report, `formatting-error:${sheetId}`);
-  markVisited(report, `char-limit-warning:${sheetId}`);
-
-  const spreadsheet = SpreadsheetApp.openById(sheetId);
-  const sheet = spreadsheet.getSheets()[0];
-
-  if (sheet.getName().trim().toLowerCase() !== REQUEST_TAB_NAME) {
+  processSingleIncomingSheet(sheetFile, parentFolder, report) {
+    const sheetName = sheetFile.getName();
+    const sheetId = sheetFile.getId();
     Logger.log(
-      `Skipping ${sheetName}: first tab "${sheet.getName()}" is not "Request".`
+      `Processing GSheet: ${sheetName} (folder: ${parentFolder.getName()})`
     );
-    return;
-  }
 
-  const detection = detectHeaderRow(sheet);
+    // Claim ownership of these dedup keys so prior notifications can resolve
+    // if this run doesn't re-record them.
+    Shared.markVisited(report, `batch-error:${sheetId}`);
+    Shared.markVisited(report, `no-grandparent:${sheetId}`);
+    Shared.markVisited(report, `formatting-error:${sheetId}`);
+    Shared.markVisited(report, `char-limit-warning:${sheetId}`);
 
-  if (!detection) {
+    const spreadsheet = SpreadsheetApp.openById(sheetId);
+    const sheet = spreadsheet.getSheets()[0];
+
+    if (sheet.getName().trim().toLowerCase() !== REQUEST_TAB_NAME) {
+      Logger.log(
+        `Skipping ${sheetName}: first tab "${sheet.getName()}" is not "Request".`
+      );
+      return;
+    }
+
+    const detection = Incoming.detectHeaderRow(sheet);
+
+    if (!detection) {
+      Logger.log(
+        `Skipping ${sheetName}: no recognized template header in first ${HEADER_SEARCH_LIMIT} rows.`
+      );
+      return;
+    }
+
+    const { headerRowIndex, template } = detection;
     Logger.log(
-      `Skipping ${sheetName}: no recognized template header in first ${HEADER_SEARCH_LIMIT} rows.`
+      `Template detected: ${template.type} (header on row ${headerRowIndex}, EN col ${template.enCol})`
     );
-    return;
-  }
 
-  const { headerRowIndex, template } = detection;
-  Logger.log(
-    `Template detected: ${template.type} (header on row ${headerRowIndex}, EN col ${template.enCol})`
-  );
+    const layout = Incoming.ensureRequestStructure(parentFolder);
 
-  const layout = ensureRequestStructure(parentFolder);
+    if (!layout) {
+      Shared.recordError(
+        report,
+        `Cannot organize ${sheetName}: parent folder "${parentFolder.getName()}" has no grandparent (expected a request folder above Source).`,
+        `no-grandparent:${sheetId}`
+      );
+      return;
+    }
 
-  if (!layout) {
-    recordError(
-      report,
-      `Cannot organize ${sheetName}: parent folder "${parentFolder.getName()}" has no grandparent (expected a request folder above Source).`,
-      `no-grandparent:${sheetId}`
+    if (!layout.parentIsSource) {
+      sheetFile.moveTo(layout.sourceFolder);
+      Logger.log(`Moved ${sheetName} to ${layout.sourceFolder.getName()}.`);
+      Shared.recordEvent(report, 'Sheet moved', sheetName, layout.sourceFolder.getUrl());
+    }
+
+    Shared.applyMozillaAudienceIndicator(sheetFile.getId());
+
+    const outputFolder = layout.sourceFolder;
+    const csvName = `${sheetName}.csv`;
+    const existingCsv = Shared.findFileInFolderByName(
+      outputFolder,
+      csvName,
+      MimeType.CSV
     );
-    return;
-  }
 
-  if (!layout.parentIsSource) {
-    sheetFile.moveTo(layout.sourceFolder);
-    Logger.log(`Moved ${sheetName} to ${layout.sourceFolder.getName()}.`);
-    recordEvent(report, 'Sheet moved', sheetName, layout.sourceFolder.getUrl());
-  }
+    if (
+      existingCsv &&
+      existingCsv.getLastUpdated() >= sheetFile.getLastUpdated()
+    ) {
+      Logger.log(`Skipping ${sheetName}: CSV "${csvName}" is already up to date.`);
+      Shared.applyMozillaAudienceIndicator(existingCsv.getId());
+      return;
+    }
 
-  applyMozillaAudienceIndicator(sheetFile.getId());
+    const firstDataRow = headerRowIndex + 1;
+    const lastRow = sheet.getLastRow();
 
-  const outputFolder = layout.sourceFolder;
-  const csvName = `${sheetName}.csv`;
-  const existingCsv = findFileInFolderByName(
-    outputFolder,
-    csvName,
-    MimeType.CSV
-  );
+    let errors = [];
+    let warnings = [];
 
-  if (
-    existingCsv &&
-    existingCsv.getLastUpdated() >= sheetFile.getLastUpdated()
-  ) {
-    Logger.log(`Skipping ${sheetName}: CSV "${csvName}" is already up to date.`);
-    applyMozillaAudienceIndicator(existingCsv.getId());
-    return;
-  }
+    if (lastRow >= firstDataRow) {
+      errors = Incoming.checkSourceFormatting(sheet, template.enCol, firstDataRow, lastRow);
 
-  const firstDataRow = headerRowIndex + 1;
-  const lastRow = sheet.getLastRow();
+      if (template.type === 'charLimit') {
+        warnings = Incoming.checkCharacterLimits(
+          sheet,
+          template.enCol,
+          template.limitCol,
+          firstDataRow,
+          lastRow
+        );
+      }
+    }
 
-  let errors = [];
-  let warnings = [];
+    if (errors.length > 0) {
+      Shared.recordError(
+        report,
+        `Cannot convert ${sheetName} (${spreadsheet.getUrl()}): ${Incoming.summarizeFormattingErrors(errors)}`,
+        `formatting-error:${sheetId}`
+      );
+      return;
+    }
 
-  if (lastRow >= firstDataRow) {
-    errors = checkSourceFormatting(sheet, template.enCol, firstDataRow, lastRow);
-
-    if (template.type === 'charLimit') {
-      warnings = checkCharacterLimits(
-        sheet,
-        template.enCol,
-        template.limitCol,
-        firstDataRow,
-        lastRow
+    if (warnings.length > 0) {
+      const warningSummary = Incoming.summarizeCharLimitWarnings(warnings);
+      console.warn(`Warnings for ${sheetName}: ${warningSummary}`);
+      Shared.recordEvent(
+        report,
+        'CSV warnings',
+        `${sheetName} - ${warningSummary}`,
+        spreadsheet.getUrl(),
+        `char-limit-warning:${sheetId}`
       );
     }
-  }
 
-  if (errors.length > 0) {
-    recordError(
-      report,
-      `Cannot convert ${sheetName} (${spreadsheet.getUrl()}): ${summarizeFormattingErrors(errors)}`,
-      `formatting-error:${sheetId}`
-    );
-    return;
-  }
+    const csvText = Incoming.cleanDirectiveRows(Incoming.exportSheetAsCsv(spreadsheet.getId()));
 
-  if (warnings.length > 0) {
-    const warningSummary = summarizeCharLimitWarnings(warnings);
-    console.warn(`Warnings for ${sheetName}: ${warningSummary}`);
-    recordEvent(
-      report,
-      'CSV warnings',
-      `${sheetName} - ${warningSummary}`,
-      spreadsheet.getUrl(),
-      `char-limit-warning:${sheetId}`
-    );
-  }
-
-  const csvText = cleanDirectiveRows(exportSheetAsCsv(spreadsheet.getId()));
-
-  if (existingCsv) {
-    removeExistingFilesWithName(outputFolder, csvName, MimeType.CSV);
-  }
-
-  const newFile = outputFolder.createFile(
-    Utilities.newBlob(csvText, 'text/csv', csvName)
-  );
-
-  applyMozillaAudienceIndicator(newFile.getId());
-
-  recordEvent(
-    report,
-    existingCsv ? 'CSV updated' : 'CSV created',
-    csvName,
-    newFile.getUrl()
-  );
-
-  Logger.log(`Finished processing ${sheetName} -> ${csvName}`);
-}
-
-// Sets up the Source / Delivery layout around the GSheet's parent folder.
-// Returns { sourceFolder, deliveryFolder, parentIsSource } or null when the
-// layout cannot be derived (e.g. parent is Source but has no grandparent).
-function ensureRequestStructure(parentFolder) {
-  const parentIsSource =
-    parentFolder.getName().trim().toLowerCase() ===
-    SOURCE_FOLDER_NAME.toLowerCase();
-
-  if (parentIsSource) {
-    const requestFolder = getFirstParent(parentFolder);
-    if (!requestFolder) {
-      return null;
+    if (existingCsv) {
+      Shared.removeExistingFilesWithName(outputFolder, csvName, MimeType.CSV);
     }
 
-    const deliveryFolder = ensureChildFolder(
-      requestFolder,
-      DELIVERY_FOLDER_NAME
+    const newFile = outputFolder.createFile(
+      Utilities.newBlob(csvText, 'text/csv', csvName)
     );
+
+    Shared.applyMozillaAudienceIndicator(newFile.getId());
+
+    Shared.recordEvent(
+      report,
+      existingCsv ? 'CSV updated' : 'CSV created',
+      csvName,
+      newFile.getUrl()
+    );
+
+    Logger.log(`Finished processing ${sheetName} -> ${csvName}`);
+  },
+
+  // Sets up the Source / Delivery layout around the GSheet's parent folder.
+  // Returns { sourceFolder, deliveryFolder, parentIsSource } or null when the
+  // layout cannot be derived (e.g. parent is Source but has no grandparent).
+  ensureRequestStructure(parentFolder) {
+    const parentIsSource =
+      parentFolder.getName().trim().toLowerCase() ===
+      SOURCE_FOLDER_NAME.toLowerCase();
+
+    if (parentIsSource) {
+      const requestFolder = Shared.getFirstParent(parentFolder);
+      if (!requestFolder) {
+        return null;
+      }
+
+      const deliveryFolder = Incoming.ensureChildFolder(
+        requestFolder,
+        DELIVERY_FOLDER_NAME
+      );
+
+      return {
+        parentIsSource: true,
+        sourceFolder: parentFolder,
+        deliveryFolder
+      };
+    }
+
+    const sourceFolder = Incoming.ensureChildFolder(parentFolder, SOURCE_FOLDER_NAME);
+    const deliveryFolder = Incoming.ensureChildFolder(parentFolder, DELIVERY_FOLDER_NAME);
 
     return {
-      parentIsSource: true,
-      sourceFolder: parentFolder,
+      parentIsSource: false,
+      sourceFolder,
       deliveryFolder
     };
-  }
+  },
 
-  const sourceFolder = ensureChildFolder(parentFolder, SOURCE_FOLDER_NAME);
-  const deliveryFolder = ensureChildFolder(parentFolder, DELIVERY_FOLDER_NAME);
-
-  return {
-    parentIsSource: false,
-    sourceFolder,
-    deliveryFolder
-  };
-}
-
-function ensureChildFolder(parent, name) {
-  const existing = findChildFolderByNameCaseInsensitive(parent, name);
-  if (existing) {
-    return existing;
-  }
-
-  const created = parent.createFolder(name);
-  Logger.log(`Created folder "${name}" in ${parent.getName()}: ${created.getUrl()}`);
-  return created;
-}
-
-function detectHeaderRow(sheet) {
-  const lastRow = sheet.getLastRow();
-  const lastCol = sheet.getLastColumn();
-
-  if (lastRow < 1 || lastCol < 1) {
-    return null;
-  }
-
-  const scanRows = Math.min(HEADER_SEARCH_LIMIT, lastRow);
-  const values = sheet.getRange(1, 1, scanRows, lastCol).getValues();
-
-  for (let i = 0; i < values.length; i++) {
-    const row = values[i];
-    const firstCell = String(row[0] || '').trim();
-
-    if (firstCell.startsWith(DIRECTIVE_PREFIX)) {
-      continue;
+  ensureChildFolder(parent, name) {
+    const existing = Shared.findChildFolderByNameCaseInsensitive(parent, name);
+    if (existing) {
+      return existing;
     }
 
-    const trimmed = trimTrailingEmptyCells(row);
-    const template = detectTemplate(trimmed);
+    const created = parent.createFolder(name);
+    Logger.log(`Created folder "${name}" in ${parent.getName()}: ${created.getUrl()}`);
+    return created;
+  },
 
-    if (!template) {
+  detectHeaderRow(sheet) {
+    const lastRow = sheet.getLastRow();
+    const lastCol = sheet.getLastColumn();
+
+    if (lastRow < 1 || lastCol < 1) {
       return null;
     }
 
-    return { headerRowIndex: i + 1, template };
+    const scanRows = Math.min(HEADER_SEARCH_LIMIT, lastRow);
+    const values = sheet.getRange(1, 1, scanRows, lastCol).getValues();
+
+    for (let i = 0; i < values.length; i++) {
+      const row = values[i];
+      const firstCell = String(row[0] || '').trim();
+
+      if (firstCell.startsWith(DIRECTIVE_PREFIX)) {
+        continue;
+      }
+
+      const trimmed = Incoming.trimTrailingEmptyCells(row);
+      const template = Shared.detectTemplate(trimmed);
+
+      if (!template) {
+        return null;
+      }
+
+      return { headerRowIndex: i + 1, template };
+    }
+
+    return null;
+  },
+
+  trimTrailingEmptyCells(row) {
+    let end = row.length;
+
+    while (end > 0 && String(row[end - 1] || '').trim() === '') {
+      end--;
+    }
+
+    return row.slice(0, end);
+  },
+
+  checkSourceFormatting(sheet, enCol, firstDataRow, lastRow) {
+    const numRows = lastRow - firstDataRow + 1;
+
+    if (numRows <= 0) {
+      return [];
+    }
+
+    const range = sheet.getRange(firstDataRow, enCol, numRows, 1);
+    const values = range.getValues();
+    const richTexts = range.getRichTextValues();
+
+    const errors = [];
+
+    for (let i = 0; i < numRows; i++) {
+      const cellValue = String(values[i][0] || '').trim();
+
+      if (cellValue === '') {
+        continue;
+      }
+
+      const issues = new Set();
+      const rich = richTexts[i][0];
+
+      if (rich) {
+        Incoming.collectRichTextIssues(rich, issues);
+      }
+
+      if (issues.size > 0) {
+        errors.push({
+          row: firstDataRow + i,
+          issues: Array.from(issues)
+        });
+      }
+    }
+
+    return errors;
+  },
+
+  // A cell-level "Insert > Link" hyperlink is exposed as a single RichText run
+  // with a non-null getLinkUrl(), so this covers both cell-level and partial
+  // hyperlinks without an extra getCell().getLinkUrl() round-trip per row.
+  collectRichTextIssues(rich, issues) {
+    const runs = rich.getRuns();
+
+    for (const run of runs) {
+      const runText = run.getText();
+
+      if (!runText || runText.trim() === '') {
+        continue;
+      }
+
+      const style = run.getTextStyle();
+
+      if (style.isBold()) issues.add('bold');
+      if (style.isItalic()) issues.add('italic');
+
+      if (!Incoming.isDefaultForegroundColor(style.getForegroundColor())) {
+        issues.add('non-default color');
+      }
+
+      if (run.getLinkUrl()) {
+        issues.add('hyperlink');
+      }
+    }
+  },
+
+  checkCharacterLimits(sheet, enCol, limitCol, firstDataRow, lastRow) {
+    const numRows = lastRow - firstDataRow + 1;
+
+    if (numRows <= 0) {
+      return [];
+    }
+
+    const enValues = sheet
+      .getRange(firstDataRow, enCol, numRows, 1)
+      .getValues();
+    const limitValues = sheet
+      .getRange(firstDataRow, limitCol, numRows, 1)
+      .getValues();
+
+    const warnings = [];
+
+    for (let i = 0; i < numRows; i++) {
+      const text = String(enValues[i][0] || '');
+
+      if (text.trim() === '') {
+        continue;
+      }
+
+      const limitRaw = limitValues[i][0];
+
+      if (typeof limitRaw !== 'number' || limitRaw <= 0) {
+        continue;
+      }
+
+      const length = text.length;
+      let severity = null;
+
+      if (length > limitRaw) {
+        severity = 'over';
+      } else if (length >= CHAR_LIMIT_WARN_RATIO * limitRaw) {
+        severity = 'near';
+      }
+
+      if (severity) {
+        warnings.push({
+          row: firstDataRow + i,
+          enLength: length,
+          limit: limitRaw,
+          severity
+        });
+      }
+    }
+
+    return warnings;
+  },
+
+  isDefaultForegroundColor(color) {
+    if (color === null || color === undefined) {
+      return true;
+    }
+
+    return DEFAULT_FOREGROUND_COLORS.has(String(color).trim().toLowerCase());
+  },
+
+  // Drive.Files.export in v3 of the Advanced Drive Service returns metadata
+  // only — it doesn't deliver the exported bytes. Hit the Sheets export
+  // endpoint directly with the script's OAuth token instead.
+  exportSheetAsCsv(spreadsheetId) {
+    const url =
+      `https://docs.google.com/spreadsheets/d/${spreadsheetId}/export?format=csv`;
+
+    const response = UrlFetchApp.fetch(url, {
+      headers: { Authorization: `Bearer ${ScriptApp.getOAuthToken()}` },
+      muteHttpExceptions: true
+    });
+
+    const code = response.getResponseCode();
+    if (code !== 200) {
+      throw new Error(
+        `Sheet export failed (${code}): ${response.getContentText()}`
+      );
+    }
+
+    return response.getContentText();
+  },
+
+  cleanDirectiveRows(csvText) {
+    const lines = csvText.split(/\r?\n/);
+
+    const cleaned = lines.map(line => {
+      if (line.startsWith(DIRECTIVE_PREFIX)) {
+        return line.replace(/,+$/, '');
+      }
+      return line;
+    });
+
+    return cleaned.join('\n');
+  },
+
+  summarizeFormattingErrors(errors) {
+    const head = errors
+      .slice(0, ERROR_ROW_PREVIEW_LIMIT)
+      .map(e => `row ${e.row} [${e.issues.join(', ')}]`)
+      .join('; ');
+
+    const extra = errors.length - ERROR_ROW_PREVIEW_LIMIT;
+    const suffix = extra > 0 ? `; and ${extra} more` : '';
+
+    return `${errors.length} error cell(s) - ${head}${suffix}`;
+  },
+
+  summarizeCharLimitWarnings(warnings) {
+    const overCount = warnings.filter(w => w.severity === 'over').length;
+    const nearCount = warnings.length - overCount;
+
+    const counts = [];
+    if (overCount > 0) counts.push(`${overCount} over limit`);
+    if (nearCount > 0) counts.push(`${nearCount} near limit`);
+
+    const head = warnings
+      .slice(0, ERROR_ROW_PREVIEW_LIMIT)
+      .map(w => `row ${w.row} ${w.severity} limit (${w.enLength}/${w.limit})`)
+      .join('; ');
+
+    const extra = warnings.length - ERROR_ROW_PREVIEW_LIMIT;
+    const suffix = extra > 0 ? ` and ${extra} more` : '';
+
+    return `${counts.join(', ')}: ${head}${suffix}`;
   }
-
-  return null;
-}
-
-function trimTrailingEmptyCells(row) {
-  let end = row.length;
-
-  while (end > 0 && String(row[end - 1] || '').trim() === '') {
-    end--;
-  }
-
-  return row.slice(0, end);
-}
-
-function checkSourceFormatting(sheet, enCol, firstDataRow, lastRow) {
-  const numRows = lastRow - firstDataRow + 1;
-
-  if (numRows <= 0) {
-    return [];
-  }
-
-  const range = sheet.getRange(firstDataRow, enCol, numRows, 1);
-  const values = range.getValues();
-  const richTexts = range.getRichTextValues();
-
-  const errors = [];
-
-  for (let i = 0; i < numRows; i++) {
-    const cellValue = String(values[i][0] || '').trim();
-
-    if (cellValue === '') {
-      continue;
-    }
-
-    const issues = new Set();
-    const rich = richTexts[i][0];
-
-    if (rich) {
-      collectRichTextIssues(rich, issues);
-    }
-
-    if (issues.size > 0) {
-      errors.push({
-        row: firstDataRow + i,
-        issues: Array.from(issues)
-      });
-    }
-  }
-
-  return errors;
-}
-
-// A cell-level "Insert > Link" hyperlink is exposed as a single RichText run
-// with a non-null getLinkUrl(), so this covers both cell-level and partial
-// hyperlinks without an extra getCell().getLinkUrl() round-trip per row.
-function collectRichTextIssues(rich, issues) {
-  const runs = rich.getRuns();
-
-  for (const run of runs) {
-    const runText = run.getText();
-
-    if (!runText || runText.trim() === '') {
-      continue;
-    }
-
-    const style = run.getTextStyle();
-
-    if (style.isBold()) issues.add('bold');
-    if (style.isItalic()) issues.add('italic');
-
-    if (!isDefaultForegroundColor(style.getForegroundColor())) {
-      issues.add('non-default color');
-    }
-
-    if (run.getLinkUrl()) {
-      issues.add('hyperlink');
-    }
-  }
-}
-
-function checkCharacterLimits(sheet, enCol, limitCol, firstDataRow, lastRow) {
-  const numRows = lastRow - firstDataRow + 1;
-
-  if (numRows <= 0) {
-    return [];
-  }
-
-  const enValues = sheet
-    .getRange(firstDataRow, enCol, numRows, 1)
-    .getValues();
-  const limitValues = sheet
-    .getRange(firstDataRow, limitCol, numRows, 1)
-    .getValues();
-
-  const warnings = [];
-
-  for (let i = 0; i < numRows; i++) {
-    const text = String(enValues[i][0] || '');
-
-    if (text.trim() === '') {
-      continue;
-    }
-
-    const limitRaw = limitValues[i][0];
-
-    if (typeof limitRaw !== 'number' || limitRaw <= 0) {
-      continue;
-    }
-
-    const length = text.length;
-    let severity = null;
-
-    if (length > limitRaw) {
-      severity = 'over';
-    } else if (length >= CHAR_LIMIT_WARN_RATIO * limitRaw) {
-      severity = 'near';
-    }
-
-    if (severity) {
-      warnings.push({
-        row: firstDataRow + i,
-        enLength: length,
-        limit: limitRaw,
-        severity
-      });
-    }
-  }
-
-  return warnings;
-}
-
-function isDefaultForegroundColor(color) {
-  if (color === null || color === undefined) {
-    return true;
-  }
-
-  return DEFAULT_FOREGROUND_COLORS.has(String(color).trim().toLowerCase());
-}
-
-// Drive.Files.export in v3 of the Advanced Drive Service returns metadata
-// only — it doesn't deliver the exported bytes. Hit the Sheets export
-// endpoint directly with the script's OAuth token instead.
-function exportSheetAsCsv(spreadsheetId) {
-  const url =
-    `https://docs.google.com/spreadsheets/d/${spreadsheetId}/export?format=csv`;
-
-  const response = UrlFetchApp.fetch(url, {
-    headers: { Authorization: `Bearer ${ScriptApp.getOAuthToken()}` },
-    muteHttpExceptions: true
-  });
-
-  const code = response.getResponseCode();
-  if (code !== 200) {
-    throw new Error(
-      `Sheet export failed (${code}): ${response.getContentText()}`
-    );
-  }
-
-  return response.getContentText();
-}
-
-function cleanDirectiveRows(csvText) {
-  const lines = csvText.split(/\r?\n/);
-
-  const cleaned = lines.map(line => {
-    if (line.startsWith(DIRECTIVE_PREFIX)) {
-      return line.replace(/,+$/, '');
-    }
-    return line;
-  });
-
-  return cleaned.join('\n');
-}
-
-function summarizeFormattingErrors(errors) {
-  const head = errors
-    .slice(0, ERROR_ROW_PREVIEW_LIMIT)
-    .map(e => `row ${e.row} [${e.issues.join(', ')}]`)
-    .join('; ');
-
-  const extra = errors.length - ERROR_ROW_PREVIEW_LIMIT;
-  const suffix = extra > 0 ? `; and ${extra} more` : '';
-
-  return `${errors.length} error cell(s) - ${head}${suffix}`;
-}
-
-function summarizeCharLimitWarnings(warnings) {
-  const overCount = warnings.filter(w => w.severity === 'over').length;
-  const nearCount = warnings.length - overCount;
-
-  const counts = [];
-  if (overCount > 0) counts.push(`${overCount} over limit`);
-  if (nearCount > 0) counts.push(`${nearCount} near limit`);
-
-  const head = warnings
-    .slice(0, ERROR_ROW_PREVIEW_LIMIT)
-    .map(w => `row ${w.row} ${w.severity} limit (${w.enLength}/${w.limit})`)
-    .join('; ');
-
-  const extra = warnings.length - ERROR_ROW_PREVIEW_LIMIT;
-  const suffix = extra > 0 ? ` and ${extra} more` : '';
-
-  return `${counts.join(', ')}: ${head}${suffix}`;
-}
+};
