@@ -31,6 +31,17 @@ Drive helpers:
   (and optional mimeType filter).
 - Shared.applyMozillaAudienceIndicator: idempotently tag a file with the
   Mozilla audience Drive label (no-op if already set).
+- Shared.getRequesterIdentity: best-effort identity lookup for the user
+  who "requested" a file. Prefers the user behind the earliest revision
+  (most reliable signal for "original author"), falling back to the first
+  editor returned by Apps Script, then to the file owner. Returns
+  { email, name, source, ownerEmail, ownerName } where source is
+  'first-revision', 'editor', or 'owner', so the caller can detect and
+  log when the picked identity differs from the owner. Returns null if
+  no strategy yields a usable email.
+- Shared.ensureFolderSharedAsContentManager: idempotently grant a user the
+  Content Manager (fileOrganizer) role on a Shared Drive folder; upgrades
+  the role if the user already has a lower one.
 
 Reporting:
 - Shared.createRunReport / recordEvent / recordError / sendSlackReport: per-run
@@ -416,6 +427,155 @@ const Shared = {
         }
       ]
     }, fileId);
+  },
+
+  // Best-effort identity lookup for the "requester" of a file. Order:
+  //   1. lastModifyingUser on the earliest revision (closest signal to
+  //      "who created this request"). Apps Script's getEditors() returns
+  //      editors in an unstable order unrelated to revision history, so we
+  //      consult Drive.Revisions.list instead.
+  //   2. First editor with a usable email (fallback if the revisions API
+  //      returns nothing — e.g. for non-native files).
+  //   3. File owner (last-resort fallback; on Shared Drives owners are
+  //      frequently null).
+  // Returns { email, name, source, ownerEmail, ownerName } or null if no
+  // strategy yields a usable email. `name` may be the empty string.
+  getRequesterIdentity(file) {
+    const owner = file.getOwner();
+    const ownerEmail = owner ? owner.getEmail() : '';
+    const ownerName = owner ? (owner.getName() || '') : '';
+
+    try {
+      const response = Drive.Revisions.list(file.getId(), {
+        fields:
+          'revisions(id,modifiedTime,lastModifyingUser(emailAddress,displayName))'
+      });
+      const revisions = response.revisions || [];
+
+      // Defensive: scan for the chronological minimum rather than trusting
+      // list order. Drive typically returns oldest-first, but we don't rely
+      // on that.
+      let earliest = null;
+      for (const r of revisions) {
+        if (!earliest || new Date(r.modifiedTime) < new Date(earliest.modifiedTime)) {
+          earliest = r;
+        }
+      }
+
+      const user = earliest ? earliest.lastModifyingUser : null;
+      if (user && user.emailAddress) {
+        return {
+          email: user.emailAddress,
+          name: user.displayName || '',
+          source: 'first-revision',
+          ownerEmail,
+          ownerName
+        };
+      }
+    } catch (error) {
+      Logger.log(`Revisions lookup failed for "${file.getName()}": ${error}`);
+    }
+
+    for (const editor of file.getEditors()) {
+      const email = editor.getEmail();
+      if (email) {
+        return {
+          email,
+          name: editor.getName() || '',
+          source: 'editor',
+          ownerEmail,
+          ownerName
+        };
+      }
+    }
+
+    if (ownerEmail) {
+      return {
+        email: ownerEmail,
+        name: ownerName,
+        source: 'owner',
+        ownerEmail,
+        ownerName
+      };
+    }
+
+    return null;
+  },
+
+  // Idempotently ensures `email` has Content Manager (fileOrganizer) rights on
+  // `folder`. Returns { added, upgraded }: `added` when a brand-new permission
+  // was created, `upgraded` when an existing lower-tier permission was raised
+  // to fileOrganizer. Both false means the principal already had sufficient
+  // direct rights.
+  //
+  // We match both 'user' and 'group' permission types because Drive will
+  // store the principal as a group when the email resolves to a Google Group,
+  // even if we send the create request with type 'user'. Without that, the
+  // next run wouldn't find the permission and would re-create it, producing
+  // a duplicate "Folder shared" event.
+  //
+  // Inherited permissions are ignored — a permission inherited from a parent
+  // folder would not survive moving the folder to another Shared Drive, so we
+  // still want a direct permission on this folder.
+  //
+  // `fileOrganizer` is shared-drive-only — calling this on a My Drive folder
+  // will throw via the Drive API.
+  ensureFolderSharedAsContentManager(folder, email) {
+    const folderId = folder.getId();
+    const normalizedEmail = String(email || '').trim().toLowerCase();
+
+    const listed = Drive.Permissions.list(folderId, {
+      supportsAllDrives: true,
+      fields:
+        'permissions(id,type,role,emailAddress,' +
+        'permissionDetails(inherited,inheritedFrom,permissionType,role))'
+    });
+
+    const existing = (listed.permissions || []).find(p => {
+      if (p.type !== 'user' && p.type !== 'group') return false;
+      if (String(p.emailAddress || '').trim().toLowerCase() !== normalizedEmail) {
+        return false;
+      }
+      const details = p.permissionDetails;
+      if (Array.isArray(details) && details.some(d => d.inherited)) {
+        return false;
+      }
+      return true;
+    });
+
+    if (existing) {
+      if (existing.role === 'fileOrganizer' || existing.role === 'organizer') {
+        return { added: false, upgraded: false };
+      }
+
+      Drive.Permissions.update(
+        { role: 'fileOrganizer' },
+        folderId,
+        existing.id,
+        { supportsAllDrives: true }
+      );
+      return { added: false, upgraded: true };
+    }
+
+    const created = Drive.Permissions.create(
+      {
+        type: 'user',
+        role: 'fileOrganizer',
+        emailAddress: email
+      },
+      folderId,
+      {
+        supportsAllDrives: true,
+        sendNotificationEmail: false,
+        fields: 'id,type,role,emailAddress'
+      }
+    );
+    Logger.log(
+      `Created permission on "${folder.getName()}": ` +
+        `id=${created.id}, type=${created.type}, role=${created.role}, ` +
+        `email=${created.emailAddress}`
+    );
+    return { added: true, upgraded: false };
   },
 
   // Trashes every file in `folder` whose name equals `name`. If `mimeType` is

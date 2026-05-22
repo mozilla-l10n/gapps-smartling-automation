@@ -29,15 +29,20 @@ For each Google Sheet found:
      "Source" and "Delivery" subfolders if missing, and move the GSheet into
      Source.
    The Source folder is always where the CSV is written.
-4. Skip regeneration if a CSV with the same name already exists in the Source
+4. Grant the requester (Sheet owner, or first editor when no owner is set)
+   Content Manager rights on the request folder, so they keep visibility into
+   their own request when it's later moved to another Shared Drive. Direct
+   permissions travel with the folder; inherited ones do not. Idempotent:
+   reuses or upgrades any existing permission rather than re-adding.
+5. Skip regeneration if a CSV with the same name already exists in the Source
    folder and its lastUpdated >= the GSheet's lastUpdated.
-5. Run quality checks on the EN source column (data rows below the header):
+6. Run quality checks on the EN source column (data rows below the header):
    - ERROR (blocks conversion): bold, italic, non-default foreground color,
      or any hyperlink in the cell (cell-level or rich-text run). CSV cannot
      preserve these.
    - WARNING (char-limit template only, never blocks): EN length >= 90% of
      the value in the Target Character Limit column on the same row.
-6. If there are no errors, export the spreadsheet to CSV via the Sheets
+7. If there are no errors, export the spreadsheet to CSV via the Sheets
    export endpoint, strip trailing commas from directive rows (lines
    starting with "#"), trash any stale CSV with the same name, and write
    the new file into the Source folder.
@@ -179,6 +184,8 @@ const Incoming = {
     Shared.markVisited(report, `no-grandparent:${sheetId}`);
     Shared.markVisited(report, `formatting-error:${sheetId}`);
     Shared.markVisited(report, `char-limit-warning:${sheetId}`);
+    Shared.markVisited(report, `share-no-recipient:${sheetId}`);
+    Shared.markVisited(report, `share-failed:${sheetId}`);
 
     const spreadsheet = SpreadsheetApp.openById(sheetId);
     const sheet = spreadsheet.getSheets()[0];
@@ -222,6 +229,8 @@ const Incoming = {
     }
 
     Shared.applyMozillaAudienceIndicator(sheetFile.getId());
+
+    Incoming.shareRequestFolderWithRequester(sheetFile, layout.requestFolder, report);
 
     const outputFolder = layout.sourceFolder;
     const csvName = `${sheetName}.csv`;
@@ -324,6 +333,7 @@ const Incoming = {
 
       return {
         parentIsSource: true,
+        requestFolder,
         sourceFolder: parentFolder,
         deliveryFolder
       };
@@ -334,9 +344,70 @@ const Incoming = {
 
     return {
       parentIsSource: false,
+      requestFolder: parentFolder,
       sourceFolder,
       deliveryFolder
     };
+  },
+
+  // Grants the requester (Sheet owner, or first editor when no owner is set)
+  // Content Manager rights on the request folder so they retain visibility
+  // into their own request after it's moved between Shared Drives. Direct
+  // permissions travel with the folder; inherited ones do not.
+  shareRequestFolderWithRequester(sheetFile, requestFolder, report) {
+    const sheetId = sheetFile.getId();
+    const requester = Shared.getRequesterIdentity(sheetFile);
+
+    if (!requester) {
+      Logger.log(
+        `No requester email available for "${sheetFile.getName()}"; skipping folder share.`
+      );
+      Shared.recordError(
+        report,
+        `Cannot share ${requestFolder.getName()} (${requestFolder.getUrl()}): ` +
+          `Sheet "${sheetFile.getName()}" has no retrievable requester email.`,
+        `share-no-recipient:${sheetId}`
+      );
+      return;
+    }
+
+    Logger.log(
+      `Identified requester for "${sheetFile.getName()}": ` +
+        `${requester.name || '(no name)'} <${requester.email}> [from ${requester.source}]`
+    );
+
+    if (
+      requester.ownerEmail &&
+      requester.ownerEmail.toLowerCase() !== requester.email.toLowerCase()
+    ) {
+      Logger.log(
+        `Picked identity differs from owner for "${sheetFile.getName()}": ` +
+          `owner=${requester.ownerName || '(no name)'} <${requester.ownerEmail}>`
+      );
+    }
+
+    let result;
+    try {
+      result = Shared.ensureFolderSharedAsContentManager(requestFolder, requester.email);
+    } catch (error) {
+      Shared.recordError(
+        report,
+        `Failed to share ${requestFolder.getName()} (${requestFolder.getUrl()}) ` +
+          `with ${requester.email}: ${error}`,
+        `share-failed:${sheetId}`
+      );
+      return;
+    }
+
+    if (result.added) {
+      Logger.log(
+        `Folder shared: ${requestFolder.getName()} → ${requester.email} (${requestFolder.getUrl()})`
+      );
+    } else if (result.upgraded) {
+      Logger.log(
+        `Folder share upgraded: ${requestFolder.getName()} → ${requester.email} (${requestFolder.getUrl()})`
+      );
+    }
   },
 
   ensureChildFolder(parent, name) {
