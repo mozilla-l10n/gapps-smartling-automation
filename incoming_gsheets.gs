@@ -37,9 +37,11 @@ For each Google Sheet found:
 5. Skip regeneration if a CSV with the same name already exists in the Source
    folder and its lastUpdated >= the GSheet's lastUpdated.
 6. Run quality checks on the EN source column (data rows below the header):
-   - ERROR (blocks conversion): bold, italic, non-default foreground color,
-     or any hyperlink in the cell (cell-level or rich-text run). CSV cannot
-     preserve these.
+   - ERROR (blocks conversion): bold, italic, or any hyperlink in the cell
+     (cell-level or rich-text run). CSV cannot preserve these.
+   - WARNING (never blocks): a non-default foreground color in the cell. CSV
+     drops it, but unlike bold/italic/links it rarely carries meaning that
+     must survive translation, so it's reported for visibility only.
    - ERROR (blocks conversion): a fully blank row in the middle of the table
      (a gap between real rows), or a row that has content but leaves the EN
      source cell empty. Cells holding only a formula (e.g. a Target Language
@@ -82,6 +84,12 @@ const ERROR_ROW_PREVIEW_LIMIT = 5;
 
 // Foreground colors treated as "no color set" — anything else is flagged.
 const DEFAULT_FOREGROUND_COLORS = new Set(['', '#000000', '#000']);
+
+// Rich-text issues reported as non-blocking warnings instead of hard errors.
+// CSV drops all formatting, but a non-default text color (unlike bold, italic,
+// or a hyperlink) rarely encodes meaning that must survive into translation,
+// so it's surfaced for visibility without blocking conversion.
+const FORMATTING_WARNING_ISSUES = new Set(['non-default color']);
 
 function processIncomingSheets() {
   Shared.runWithReport('processIncomingSheets', report => {
@@ -189,6 +197,7 @@ const Incoming = {
     Shared.markVisited(report, `batch-error:${sheetId}`);
     Shared.markVisited(report, `no-grandparent:${sheetId}`);
     Shared.markVisited(report, `formatting-error:${sheetId}`);
+    Shared.markVisited(report, `formatting-warning:${sheetId}`);
     Shared.markVisited(report, `char-limit-warning:${sheetId}`);
     Shared.markVisited(report, `share-no-recipient:${sheetId}`);
     Shared.markVisited(report, `share-failed:${sheetId}`);
@@ -259,17 +268,24 @@ const Incoming = {
     const lastRow = sheet.getLastRow();
 
     let errors = [];
-    let warnings = [];
+    let formattingWarnings = [];
+    let charLimitWarnings = [];
 
     if (lastRow >= firstDataRow) {
-      errors = Incoming.checkSourceFormatting(sheet, template.enCol, firstDataRow, lastRow);
-      errors = errors.concat(
+      const formatting = Incoming.checkSourceFormatting(
+        sheet,
+        template.enCol,
+        firstDataRow,
+        lastRow
+      );
+      errors = formatting.errors.concat(
         Incoming.checkRowIntegrity(sheet, template.enCol, firstDataRow, lastRow)
       );
       errors.sort((a, b) => a.row - b.row);
+      formattingWarnings = formatting.warnings;
 
       if (template.type === 'charLimit') {
-        warnings = Incoming.checkCharacterLimits(
+        charLimitWarnings = Incoming.checkCharacterLimits(
           sheet,
           template.enCol,
           template.limitCol,
@@ -288,8 +304,20 @@ const Incoming = {
       return;
     }
 
-    if (warnings.length > 0) {
-      const warningSummary = Incoming.summarizeCharLimitWarnings(warnings);
+    if (formattingWarnings.length > 0) {
+      const summary = Incoming.summarizeFormattingErrors(formattingWarnings);
+      console.warn(`Formatting warnings for ${sheetName}: ${summary}`);
+      Shared.recordEvent(
+        report,
+        'CSV warnings',
+        `${sheetName} - ${summary}`,
+        spreadsheet.getUrl(),
+        `formatting-warning:${sheetId}`
+      );
+    }
+
+    if (charLimitWarnings.length > 0) {
+      const warningSummary = Incoming.summarizeCharLimitWarnings(charLimitWarnings);
       console.warn(`Warnings for ${sheetName}: ${warningSummary}`);
       Shared.recordEvent(
         report,
@@ -473,11 +501,16 @@ const Incoming = {
     return row.slice(0, end);
   },
 
+  // Returns { errors, warnings }. Blocking issues (bold, italic, hyperlink)
+  // go in errors; issues listed in FORMATTING_WARNING_ISSUES (non-default
+  // color) go in warnings. A single row can land in both lists if it carries
+  // a mix. Both use the { row, issues } shape so summarizeFormattingErrors
+  // formats either one.
   checkSourceFormatting(sheet, enCol, firstDataRow, lastRow) {
     const numRows = lastRow - firstDataRow + 1;
 
     if (numRows <= 0) {
-      return [];
+      return { errors: [], warnings: [] };
     }
 
     const range = sheet.getRange(firstDataRow, enCol, numRows, 1);
@@ -485,6 +518,7 @@ const Incoming = {
     const richTexts = range.getRichTextValues();
 
     const errors = [];
+    const warnings = [];
 
     for (let i = 0; i < numRows; i++) {
       const cellValue = String(values[i][0] || '').trim();
@@ -500,22 +534,35 @@ const Incoming = {
         Incoming.collectRichTextIssues(rich, issues);
       }
 
-      if (issues.size > 0) {
-        errors.push({
-          row: firstDataRow + i,
-          issues: Array.from(issues)
-        });
+      if (issues.size === 0) {
+        continue;
+      }
+
+      const row = firstDataRow + i;
+      const blocking = [];
+      const warning = [];
+
+      for (const issue of issues) {
+        (FORMATTING_WARNING_ISSUES.has(issue) ? warning : blocking).push(issue);
+      }
+
+      if (blocking.length > 0) {
+        errors.push({ row, issues: blocking });
+      }
+      if (warning.length > 0) {
+        warnings.push({ row, issues: warning });
       }
     }
 
-    return errors;
+    return { errors, warnings };
   },
 
   // Flags structural gaps in the data region: fully blank rows wedged between
   // real rows, and rows that carry content but leave the EN source cell empty.
   // Both yield CSV rows with no usable source string, so they block conversion.
-  // Returns the same { row, issues } shape as checkSourceFormatting so the two
-  // result sets merge and summarize uniformly.
+  // Returns a list of { row, issues } entries — the same per-row shape
+  // checkSourceFormatting puts in its errors list — so the two error sets
+  // merge and summarize uniformly.
   checkRowIntegrity(sheet, enCol, firstDataRow, lastRow) {
     const numRows = lastRow - firstDataRow + 1;
 
