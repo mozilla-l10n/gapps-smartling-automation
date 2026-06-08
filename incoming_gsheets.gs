@@ -40,6 +40,12 @@ For each Google Sheet found:
    - ERROR (blocks conversion): bold, italic, non-default foreground color,
      or any hyperlink in the cell (cell-level or rich-text run). CSV cannot
      preserve these.
+   - ERROR (blocks conversion): a fully blank row in the middle of the table
+     (a gap between real rows), or a row that has content but leaves the EN
+     source cell empty. Cells holding only a formula (e.g. a Target Language
+     cell pre-filled with =B9) don't count as content, so a visually empty
+     row is treated as empty even when such a formula resolves to a value.
+     Directive rows (starting with "#") are exempt.
    - WARNING (char-limit template only, never blocks): EN length >= 90% of
      the value in the Target Character Limit column on the same row.
 7. If there are no errors, export the spreadsheet to CSV via the Sheets
@@ -257,6 +263,10 @@ const Incoming = {
 
     if (lastRow >= firstDataRow) {
       errors = Incoming.checkSourceFormatting(sheet, template.enCol, firstDataRow, lastRow);
+      errors = errors.concat(
+        Incoming.checkRowIntegrity(sheet, template.enCol, firstDataRow, lastRow)
+      );
+      errors.sort((a, b) => a.row - b.row);
 
       if (template.type === 'charLimit') {
         warnings = Incoming.checkCharacterLimits(
@@ -501,6 +511,79 @@ const Incoming = {
     return errors;
   },
 
+  // Flags structural gaps in the data region: fully blank rows wedged between
+  // real rows, and rows that carry content but leave the EN source cell empty.
+  // Both yield CSV rows with no usable source string, so they block conversion.
+  // Returns the same { row, issues } shape as checkSourceFormatting so the two
+  // result sets merge and summarize uniformly.
+  checkRowIntegrity(sheet, enCol, firstDataRow, lastRow) {
+    const numRows = lastRow - firstDataRow + 1;
+
+    if (numRows <= 0) {
+      return [];
+    }
+
+    const lastCol = sheet.getLastColumn();
+    const range = sheet.getRange(firstDataRow, 1, numRows, lastCol);
+    const values = range.getValues();
+    const formulas = range.getFormulas();
+
+    // A cell counts as real content only when it holds a literal, non-blank
+    // value. Target-language cells are routinely pre-filled with formulas
+    // (e.g. =B9) that mirror the EN source; on a visually empty row such a
+    // formula still resolves to a non-blank value via getValues() (a reference
+    // to an empty cell can even come back as 0). getFormulas() returns '' for
+    // non-formula cells, so we treat any formula cell as empty.
+    const hasContent = (i, col) =>
+      formulas[i][col] === '' && String(values[i][col] || '').trim() !== '';
+
+    // Directive rows (starting with "#") are passed through to the CSV
+    // verbatim and never carry EN copy, so they're exempt from both checks.
+    const isDirective = i =>
+      String(values[i][0] || '').trim().startsWith(DIRECTIVE_PREFIX);
+
+    const rowHasContent = i => {
+      for (let col = 0; col < lastCol; col++) {
+        if (hasContent(i, col)) {
+          return true;
+        }
+      }
+      return false;
+    };
+
+    // getLastRow() counts formula cells, and these templates pre-fill the
+    // Target Language column with formulas far below the real data — so the
+    // table doesn't actually end at lastRow. Anchor on the last row carrying
+    // literal content; everything past it is trailing formula/blank filler and
+    // is not a mid-table gap.
+    let lastContentIndex = -1;
+    for (let i = numRows - 1; i >= 0; i--) {
+      if (!isDirective(i) && rowHasContent(i)) {
+        lastContentIndex = i;
+        break;
+      }
+    }
+
+    const errors = [];
+
+    for (let i = 0; i <= lastContentIndex; i++) {
+      if (isDirective(i)) {
+        continue;
+      }
+
+      if (!rowHasContent(i)) {
+        errors.push({ row: firstDataRow + i, issues: ['empty row'] });
+        continue;
+      }
+
+      if (!hasContent(i, enCol - 1)) {
+        errors.push({ row: firstDataRow + i, issues: ['missing EN copy'] });
+      }
+    }
+
+    return errors;
+  },
+
   // A cell-level "Insert > Link" hyperlink is exposed as a single RichText run
   // with a non-null getLinkUrl(), so this covers both cell-level and partial
   // hyperlinks without an extra getCell().getLinkUrl() round-trip per row.
@@ -632,7 +715,7 @@ const Incoming = {
     const extra = errors.length - ERROR_ROW_PREVIEW_LIMIT;
     const suffix = extra > 0 ? `; and ${extra} more` : '';
 
-    return `${errors.length} error cell(s) - ${head}${suffix}`;
+    return `${errors.length} issue(s) - ${head}${suffix}`;
   },
 
   summarizeCharLimitWarnings(warnings) {
