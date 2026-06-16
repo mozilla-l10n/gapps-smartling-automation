@@ -21,6 +21,10 @@ For each .csv in the folder:
    - Apply header styling, column widths, frozen header row, wrap/top-align,
      and conditional formatting that highlights target cells exceeding the
      "Target Character Limit" in column B.
+   - For char-limit templates (column B = "Target Character Limit"), repurpose
+     column A into a live count of the localized text: header becomes
+     "Locale Character Count" and each data row gets =LEN(<localeCol><row>),
+     where the locale column is the last column.
 4. Apply the "Specific Workgroups and Individuals = Mozilla Audience" Drive
    label to both the CSV and the resulting Sheet, unless an audience value
    is already set on the file (manual overrides are preserved).
@@ -46,6 +50,7 @@ Required services:
 const COLUMN_WIDTH = 220;
 const SURVEY_COLUMN_WIDTH = 400;
 const HEADER_COLOR = '#f9cb9c';
+const LOCALE_CHARACTER_COUNT_HEADER = 'Locale Character Count';
 
 function processCsvFiles() {
   Shared.runWithReport('processCsvFiles', report => {
@@ -229,6 +234,50 @@ const Convert = {
     sheet.setFrozenRows(1);
 
     Convert.addCharacterLimitConditionalFormatting(sheet, numRows, numCols);
+    Convert.addLocaleCharacterCountColumn(sheet, numRows, numCols);
+  },
+
+  // Char-limit templates ship column A as a static "EN Character count". Once
+  // converted, the source EN copy never changes but the localized text in the
+  // last (locale) column does, so repurpose column A into a live count of the
+  // localized text: header "Locale Character Count" and =LEN(<localeCol><row>)
+  // down each data row. Only runs when column B is the "Target Character Limit"
+  // header (same guard as the conditional formatting below).
+  addLocaleCharacterCountColumn(sheet, numRows, numCols) {
+    if (numCols < 4) {
+      return;
+    }
+
+    if (sheet.getRange(1, 2).getValue() !== TARGET_CHARACTER_LIMIT_HEADER) {
+      return;
+    }
+
+    sheet.getRange(1, 1).setValue(LOCALE_CHARACTER_COUNT_HEADER);
+
+    if (numRows < 2) {
+      return;
+    }
+
+    // The locale (target) column is always the last column after cleanup; for
+    // the canonical char-limit layout that is column E.
+    const localeCol = Convert.columnToLetter(numCols);
+    const formulas = [];
+    for (let row = 2; row <= numRows; row++) {
+      formulas.push([`=LEN(${localeCol}${row})`]);
+    }
+
+    sheet.getRange(2, 1, numRows - 1, 1).setFormulas(formulas);
+  },
+
+  // 1-based column number -> A1 column letter(s) (1 -> "A", 27 -> "AA").
+  columnToLetter(column) {
+    let letter = '';
+    while (column > 0) {
+      const remainder = (column - 1) % 26;
+      letter = String.fromCharCode(65 + remainder) + letter;
+      column = Math.floor((column - 1) / 26);
+    }
+    return letter;
   },
 
   // Conditional formatting that highlights target cells exceeding the
