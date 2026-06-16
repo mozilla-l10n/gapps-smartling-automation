@@ -11,10 +11,11 @@ don't clutter the picker. Cross-file helpers come from `Shared` (utils.gs).
 CSV/Sheet flow (per CSV in SOURCE_FOLDER_ID):
 1. Determine BASE_FILENAME by stripping the locale suffix and .csv extension.
    Example: CC58000_..._v2_foo.csv  ->  CC58000_..._v2
-2. Look up BASE_FILENAME via a Drive query, filtered to Google Sheets whose
-   parent folder is named "Source" and lives somewhere under DEST_FOLDER_ID.
-   Results are memoized in-memory per run so multiple locales of the same base
-   name don't re-query.
+2. Look up BASE_FILENAME via the Advanced Drive Service (Drive.Files.list with
+   all-drives support, since DriveApp.searchFiles does not reliably return
+   Shared Drive items), filtered to Google Sheets whose parent folder is named
+   "Source" and lives somewhere under DEST_FOLDER_ID. Results are memoized
+   in-memory per run so multiple locales of the same base name don't re-query.
 3. Walk one level up from Source to the project folder; find Delivery, and
    create Original / Delivery to Customer subfolders if missing.
 4. Move the generated Google Sheet (same name as the CSV minus extension) into
@@ -288,37 +289,59 @@ const Organize = {
       .replace(/'/g, "\\'");
 
     const query =
-      `title = '${escapedName}' and ` +
+      `name = '${escapedName}' and ` +
       `mimeType = '${mimeType}' and ` +
       `trashed = false`;
 
-    const files = DriveApp.searchFiles(query);
     const matches = [];
     const descendantCache = new Map();
+    let pageToken = null;
 
-    while (files.hasNext()) {
-      const file = files.next();
+    // Use the Advanced Drive Service rather than DriveApp.searchFiles: the
+    // latter does not reliably return Shared Drive items, so a stable file is
+    // intermittently missed and then found on a later run. The all-drives flags
+    // below make the query consistent across Shared Drives. `parents` comes
+    // back inline, so the parent lookup no longer needs a getParents() call.
+    do {
+      const response = Drive.Files.list({
+        q: query,
+        corpora: 'allDrives',
+        includeItemsFromAllDrives: true,
+        supportsAllDrives: true,
+        fields: 'nextPageToken, files(id, name, parents)',
+        pageSize: 100,
+        pageToken: pageToken
+      });
 
-      if (file.getName() !== baseFileName) {
-        continue;
+      for (const file of response.files || []) {
+        if (file.name !== baseFileName) {
+          continue;
+        }
+
+        const parentId = (file.parents || [])[0];
+
+        if (!parentId) {
+          continue;
+        }
+
+        const parent = DriveApp.getFolderById(parentId);
+
+        if (parent.getName().toLowerCase() !== 'source') {
+          continue;
+        }
+
+        if (!Organize.isDescendantOf(parent, destRootFolder, descendantCache)) {
+          continue;
+        }
+
+        matches.push({
+          file: DriveApp.getFileById(file.id),
+          sourceFolder: parent
+        });
       }
 
-      const parent = Shared.getFirstParent(file);
-
-      if (!parent) {
-        continue;
-      }
-
-      if (parent.getName().toLowerCase() !== 'source') {
-        continue;
-      }
-
-      if (!Organize.isDescendantOf(parent, destRootFolder, descendantCache)) {
-        continue;
-      }
-
-      matches.push({ file, sourceFolder: parent });
-    }
+      pageToken = response.nextPageToken;
+    } while (pageToken);
 
     if (matches.length === 0) {
       console.error(
