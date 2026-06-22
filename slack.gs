@@ -40,17 +40,7 @@ top-level: the first is the Web App entry point, the second is a trigger target.
 // (fail closed).
 const SLACK_VERIFICATION_TOKEN_PROPERTY = 'SLACK_VERIFICATION_TOKEN';
 
-// Only this channel may trigger the pipeline. Use the channel *ID* (e.g.
-// C0123456789), not the name: the ID is stable across renames and always
-// present in the slash-command payload, whereas channel_name can change or be
-// withheld. To find it: open the channel in Slack > channel name > "About" tab,
-// the ID is at the bottom; or right-click the channel > "Copy link" and take
-// the trailing C... segment. The constant below is the #l10n-notifications
-// channel.
-const SLACK_ALLOWED_CHANNEL_ID = 'REDACTED';
-
-// Human-readable name used only in the wrong-channel rejection message.
-const SLACK_ALLOWED_CHANNEL_NAME = 'l10n-notifications';
+// SLACK_ALLOWED_CHANNEL_ID and SLACK_ALLOWED_CHANNEL_NAME are defined in config.gs.
 
 function doPost(e) {
   if (!SlackCommand.verifyRequest(e)) {

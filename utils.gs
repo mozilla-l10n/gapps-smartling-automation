@@ -69,12 +69,8 @@ const KEY_HEADER = 'Key';
 const DEFAULT_TEXT_HEADER = 'Default Text';
 const TRANSLATION_HEADER = 'Translation';
 
-// "Specific Workgroups and Individuals" label for Mozilla Audience. Used by
-// convert.gs and incoming_gsheets.gs to tag files as Mozilla-audience so
-// downstream tooling can identify them.
-const MOZILLA_AUDIENCE_LABEL_ID = 'REDACTED';
-const MOZILLA_AUDIENCE_FIELD_ID = 'REDACTED';
-const MOZILLA_AUDIENCE_SPECIFIC_WORKGROUPS_CHOICE_ID = 'REDACTED';
+// MOZILLA_AUDIENCE_LABEL_ID, MOZILLA_AUDIENCE_FIELD_ID and
+// MOZILLA_AUDIENCE_SPECIFIC_WORKGROUPS_CHOICE_ID are defined in config.gs.
 
 const Shared = {
   runWithReport(label, fn) {

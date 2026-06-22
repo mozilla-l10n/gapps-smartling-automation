@@ -1,0 +1,8 @@
+# Local deployment configuration (copy config.dist.gs to config.gs and fill in)
+config.gs
+
+# macOS
+.DS_Store
+
+# Claude Code local settings
+.claude/settings.local.json
