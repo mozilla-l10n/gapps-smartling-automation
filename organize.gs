@@ -14,8 +14,12 @@ CSV/Sheet flow (per CSV in SOURCE_FOLDER_ID):
 2. Look up BASE_FILENAME via the Advanced Drive Service (Drive.Files.list with
    all-drives support, since DriveApp.searchFiles does not reliably return
    Shared Drive items), filtered to Google Sheets whose parent folder is named
-   "Source" and lives somewhere under DEST_FOLDER_ID. Results are memoized
-   in-memory per run so multiple locales of the same base name don't re-query.
+   "Source" and lives somewhere under DEST_FOLDER_ID. An exact name match is
+   tried first; if none is found, a normalized-key fallback (case-insensitive,
+   non-alphanumeric runs collapsed to "_") catches Smartling's filename
+   sanitization (e.g. "CC58000: Foo" delivered as "CC58000_Foo") and logs a
+   warning. Results are memoized in-memory per run so multiple locales of the
+   same base name don't re-query.
 3. Walk one level up from Source to the project folder; find Delivery, and
    create Original / Delivery to Customer subfolders if missing.
 4. Move the generated Google Sheet (same name as the CSV minus extension) into
@@ -284,24 +288,112 @@ const Organize = {
       `Searching for file named "${baseFileName}" (mimeType: ${mimeType}).`
     );
 
+    // Fast path: exact server-side name match. This is the common case when
+    // the delivered filename equals the Source reference name byte-for-byte.
     const escapedName = baseFileName
       .replace(/\\/g, '\\\\')
       .replace(/'/g, "\\'");
 
-    const query =
+    const exactQuery =
       `name = '${escapedName}' and ` +
       `mimeType = '${mimeType}' and ` +
       `trashed = false`;
 
+    let matches = Organize.collectSourceCandidates(
+      exactQuery,
+      destRootFolder,
+      name => name === baseFileName
+    );
+
+    // Fallback: Smartling sanitizes punctuation in delivered filenames (e.g. a
+    // request named "CC58000: Foo" comes back as "CC58000_Foo"), so the exact
+    // name no longer matches the Source reference and re-running never helps.
+    // Retry with a normalized key (case-insensitive, every run of
+    // non-alphanumeric characters collapsed to "_"). Candidates are gathered
+    // with a `name contains` clause per alphanumeric token to keep the query
+    // bounded, then confirmed by exact normalized-key equality. We still warn
+    // so the name drift stays visible.
+    if (matches.length === 0) {
+      const targetKey = Organize.normalizeNameKey(baseFileName);
+      const containsClauses = baseFileName
+        .split(/[^\p{L}\p{N}]+/u)
+        .filter(Boolean)
+        .map(
+          token =>
+            `name contains '${token
+              .replace(/\\/g, '\\\\')
+              .replace(/'/g, "\\'")}'`
+        )
+        .join(' and ');
+
+      const fuzzyQuery =
+        `mimeType = '${mimeType}' and trashed = false` +
+        (containsClauses ? ` and ${containsClauses}` : '');
+
+      matches = Organize.collectSourceCandidates(
+        fuzzyQuery,
+        destRootFolder,
+        name => Organize.normalizeNameKey(name) === targetKey
+      );
+
+      if (matches.length > 0) {
+        console.warn(
+          `Matched "${baseFileName}" to Source file "${matches[0].file.getName()}" ` +
+            `only after normalizing punctuation (likely Smartling filename sanitization). ` +
+            `Rename so the names match exactly to silence this warning.`
+        );
+      }
+    }
+
+    if (matches.length === 0) {
+      console.error(
+        `Could not find file named "${baseFileName}" (mimeType: ${mimeType}) in any Source folder under destination root.`
+      );
+      return null;
+    }
+
+    if (matches.length > 1) {
+      console.warn(
+        `Found multiple files matching "${baseFileName}". Using the first one.`
+      );
+
+      matches.forEach(m => {
+        Logger.log(`Match: ${m.file.getName()} - ${m.file.getUrl()}`);
+      });
+    }
+
+    const referenceFile = matches[0].file;
+    const sourceFolder = matches[0].sourceFolder;
+    const projectFolder = Shared.getFirstParent(sourceFolder);
+
+    if (!projectFolder) {
+      console.error(
+        `Could not find parent folder above Source for "${baseFileName}".`
+      );
+      return null;
+    }
+
+    return {
+      referenceFile,
+      sourceFolder,
+      projectFolder
+    };
+  },
+
+  // Runs a Drive query and returns the candidates whose name passes
+  // `nameMatches` and that live directly inside a folder named "Source"
+  // somewhere under `destRootFolder`.
+  //
+  // Uses the Advanced Drive Service rather than DriveApp.searchFiles: the
+  // latter does not reliably return Shared Drive items, so a stable file is
+  // intermittently missed and then found on a later run. The all-drives flags
+  // below make the query consistent across Shared Drives. `parents` comes back
+  // inline, so the parent lookup no longer needs a getParents() call.
+  collectSourceCandidates(query, destRootFolder, nameMatches) {
     const matches = [];
     const descendantCache = new Map();
     let pageToken = null;
 
-    // Use the Advanced Drive Service rather than DriveApp.searchFiles: the
-    // latter does not reliably return Shared Drive items, so a stable file is
-    // intermittently missed and then found on a later run. The all-drives flags
-    // below make the query consistent across Shared Drives. `parents` comes
-    // back inline, so the parent lookup no longer needs a getParents() call.
     do {
       const response = Drive.Files.list({
         q: query,
@@ -314,7 +406,7 @@ const Organize = {
       });
 
       for (const file of response.files || []) {
-        if (file.name !== baseFileName) {
+        if (!nameMatches(file.name)) {
           continue;
         }
 
@@ -343,39 +435,18 @@ const Organize = {
       pageToken = response.nextPageToken;
     } while (pageToken);
 
-    if (matches.length === 0) {
-      console.error(
-        `Could not find file named "${baseFileName}" (mimeType: ${mimeType}) in any Source folder under destination root.`
-      );
-      return null;
-    }
+    return matches;
+  },
 
-    if (matches.length > 1) {
-      console.warn(
-        `Found multiple files named "${baseFileName}". Using the first one.`
-      );
-
-      matches.forEach(m => {
-        Logger.log(`Match: ${m.file.getName()} - ${m.file.getUrl()}`);
-      });
-    }
-
-    const referenceFile = matches[0].file;
-    const sourceFolder = matches[0].sourceFolder;
-    const projectFolder = Shared.getFirstParent(sourceFolder);
-
-    if (!projectFolder) {
-      console.error(
-        `Could not find parent folder above Source for "${baseFileName}".`
-      );
-      return null;
-    }
-
-    return {
-      referenceFile,
-      sourceFolder,
-      projectFolder
-    };
+  // Normalizes a filename for tolerant comparison: lowercased, with every run
+  // of non-alphanumeric characters collapsed to a single "_" and leading or
+  // trailing "_" trimmed. Makes "CC58000: VPN New tab Promo" and the delivered
+  // "CC58000_VPN New tab Promo" compare equal.
+  normalizeNameKey(name) {
+    return String(name)
+      .toLowerCase()
+      .replace(/[^\p{L}\p{N}]+/gu, '_')
+      .replace(/^_+|_+$/g, '');
   },
 
   isDescendantOf(folder, ancestor, cache) {
