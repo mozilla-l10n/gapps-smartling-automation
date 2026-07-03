@@ -92,12 +92,7 @@ const Convert = {
       : null;
     const created = !spreadsheet;
 
-    if (!spreadsheet) {
-      Logger.log(`No matching Sheet found. Creating: ${csvName}`);
-
-      spreadsheet = SpreadsheetApp.create(csvName);
-      DriveApp.getFileById(spreadsheet.getId()).moveTo(folder);
-    } else {
+    if (spreadsheet) {
       Logger.log(`Matching Sheet found: ${spreadsheet.getName()}`);
 
       const sheetFile = DriveApp.getFileById(spreadsheet.getId());
@@ -119,8 +114,11 @@ const Convert = {
       Logger.log(`Regenerating Sheet for ${csvFile.getName()}.`);
     }
 
+    // Parse before creating (or clearing) any Sheet. A malformed CSV throws
+    // here, and if the Sheet were already created/cleared we'd leave an empty
+    // Sheet behind that organize.gs would then move — hiding the failure.
     const csvContent = csvFile.getBlob().getDataAsString();
-    let values = Utilities.parseCsv(csvContent);
+    let values = Shared.parseCsv(csvContent);
 
     if (!values.length) {
       Logger.log(`Skipping empty CSV: ${csvFile.getName()}`);
@@ -129,6 +127,13 @@ const Convert = {
 
     const survey = Convert.isSurveyTemplate(values);
     values = Convert.cleanTargetColumns(values, locale);
+
+    if (!spreadsheet) {
+      Logger.log(`No matching Sheet found. Creating: ${csvName}`);
+
+      spreadsheet = SpreadsheetApp.create(csvName);
+      DriveApp.getFileById(spreadsheet.getId()).moveTo(folder);
+    }
 
     const sheet = spreadsheet.getSheets()[0];
 

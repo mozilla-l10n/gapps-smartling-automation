@@ -16,6 +16,11 @@ Name parsing:
 - Shared.splitLocaleFromName: parses a CSV/Doc name into its no-extension form,
   its base (no locale suffix), and its locale.
 
+CSV parsing:
+- Shared.parseCsv: Utilities.parseCsv with a lenient fallback for Smartling's
+  malformed quoting (stray characters after a closing quote). Never throws once
+  the fallback kicks in.
+
 Smartling template:
 - Header constants (EN_COPY_HEADER, TARGET_LANGUAGE_HEADER, etc.) stay as
   top-level constants since they are not callable and don't clutter the picker.
@@ -158,6 +163,90 @@ const Shared = {
       base: nameWithoutExtension.slice(0, match.index),
       locale: match[1].trim()
     };
+  },
+
+  // Parse CSV text into a 2D array. Tries the native, RFC-4180-strict
+  // Utilities.parseCsv first; if that throws, falls back to a lenient parser.
+  //
+  // Smartling occasionally emits quoted fields with a stray character (usually
+  // a trailing space) after the closing quote, e.g. `"...text." `. That is
+  // malformed per RFC-4180 and makes Utilities.parseCsv throw
+  // "Could not parse text". The lenient fallback tolerates it by treating any
+  // content after a closing quote as part of the field, so a single bad cell
+  // no longer fails the whole file.
+  parseCsv(content) {
+    try {
+      return Utilities.parseCsv(content);
+    } catch (error) {
+      Logger.log(
+        `Utilities.parseCsv failed (${error}); retrying with lenient parser.`
+      );
+      return Shared.parseCsvLenient(content);
+    }
+  },
+
+  // Minimal state-machine CSV parser tolerant of Smartling's malformed quoting.
+  // Unlike the strict parser it never throws: a quote inside an unquoted field
+  // or content trailing a closing quote is simply appended to the field.
+  parseCsvLenient(content) {
+    const text = String(content || '');
+    const rows = [];
+    let row = [];
+    let field = '';
+    let inQuotes = false;
+    let sawAny = false;
+
+    const endField = () => {
+      row.push(field);
+      field = '';
+    };
+    const endRow = () => {
+      endField();
+      rows.push(row);
+      row = [];
+    };
+
+    for (let i = 0; i < text.length; i++) {
+      const c = text[i];
+      sawAny = true;
+
+      if (inQuotes) {
+        if (c === '"') {
+          if (text[i + 1] === '"') {
+            field += '"';
+            i++;
+          } else {
+            inQuotes = false;
+          }
+        } else {
+          field += c;
+        }
+        continue;
+      }
+
+      if (c === '"' && field === '') {
+        inQuotes = true;
+      } else if (c === ',') {
+        endField();
+      } else if (c === '\n') {
+        endRow();
+      } else if (c === '\r') {
+        if (text[i + 1] === '\n') {
+          i++;
+        }
+        endRow();
+      } else {
+        field += c;
+      }
+    }
+
+    // Flush the trailing field/row unless the input ended exactly on a record
+    // terminator (in which case there is no dangling data to emit).
+    if (field !== '' || row.length > 0 || (sawAny && rows.length === 0)) {
+      endRow();
+    }
+
+    return rows;
   },
 
   createRunReport() {
