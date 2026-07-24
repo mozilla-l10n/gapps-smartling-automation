@@ -1,8 +1,12 @@
-# Local deployment configuration (copy config.dist.gs to config.gs and fill in)
-config.gs
+# Local deployment configuration (copy scripts/config.dist.gs to
+# scripts/config.gs and fill in)
+scripts/config.gs
 
 # macOS
 .DS_Store
 
 # Claude Code local settings
 .claude/settings.local.json
+
+# Node / test tooling
+node_modules/
