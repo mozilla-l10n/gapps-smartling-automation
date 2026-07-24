@@ -1,0 +1,14 @@
+{
+  "name": "gapps-smartling-automation",
+  "version": "1.0.0",
+  "description": "Tests for the Smartling automation Apps Script project",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "devDependencies": {
+    "vitest": "^3.2.4"
+  }
+}
