@@ -195,6 +195,7 @@ const Incoming = {
     // Claim ownership of these dedup keys so prior notifications can resolve
     // if this run doesn't re-record them.
     Shared.markVisited(report, `batch-error:${sheetId}`);
+    Shared.markVisited(report, `not-request:${sheetId}`);
     Shared.markVisited(report, `no-grandparent:${sheetId}`);
     Shared.markVisited(report, `formatting-error:${sheetId}`);
     Shared.markVisited(report, `formatting-warning:${sheetId}`);
@@ -206,8 +207,10 @@ const Incoming = {
     const sheet = spreadsheet.getSheets()[0];
 
     if (sheet.getName().trim().toLowerCase() !== REQUEST_TAB_NAME) {
-      Logger.log(
-        `Skipping ${sheetName}: first tab "${sheet.getName()}" is not "Request".`
+      Shared.recordError(
+        report,
+        `Cannot convert ${sheetName} (${spreadsheet.getUrl()}): first tab "${sheet.getName()}" is not "Request".`,
+        `not-request:${sheetId}`
       );
       return;
     }
