@@ -15,9 +15,9 @@ the Mozilla Audience Drive label so downstream tooling can identify them.
 Existing manual label values are preserved.
 
 For each Google Sheet found:
-1. Skip the file silently if the first sheet's tab is not named "Request"
+1. Skip the file if the first sheet's tab is not named "Request"
    (case-insensitive) or if no recognized template header row can be found
-   within the first 10 rows.
+   within the first 10 rows. Both cases are reported as errors.
 2. Detect the template from the header row:
    - Char-limit: column 2 = "Target Character Limit", column 4 = "EN Copy".
    - Standard:   column 2 = "EN Copy".
@@ -196,6 +196,7 @@ const Incoming = {
     // if this run doesn't re-record them.
     Shared.markVisited(report, `batch-error:${sheetId}`);
     Shared.markVisited(report, `not-request:${sheetId}`);
+    Shared.markVisited(report, `no-header:${sheetId}`);
     Shared.markVisited(report, `no-grandparent:${sheetId}`);
     Shared.markVisited(report, `formatting-error:${sheetId}`);
     Shared.markVisited(report, `formatting-warning:${sheetId}`);
@@ -218,8 +219,10 @@ const Incoming = {
     const detection = Incoming.detectHeaderRow(sheet);
 
     if (!detection) {
-      Logger.log(
-        `Skipping ${sheetName}: no recognized template header in first ${HEADER_SEARCH_LIMIT} rows.`
+      Shared.recordError(
+        report,
+        `Cannot convert ${sheetName} (${spreadsheet.getUrl()}): no recognized template header in first ${HEADER_SEARCH_LIMIT} rows.`,
+        `no-header:${sheetId}`
       );
       return;
     }
